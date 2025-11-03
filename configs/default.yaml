@@ -1,0 +1,70 @@
+project:
+  name: loc4pm
+  seed: 42
+  exp_dir: experiments
+  log_dir: experiments/logs
+  ckpt_dir: experiments/ckpt
+  results_dir: experiments/results
+
+data:
+  root: /ocean/projects/cis250170p/zwang63/data/loc4pm/processed/EO_NCAR_merged
+  start_date: 2017-02-01
+  end_date:   2018-12-31
+  x_prefix: TS_X_
+  y_prefix: TS_y_
+  drop_feature_indices: [5,6,20,21,22,23,24]
+  filter_y_positive: true
+  remove_nan_rows: true
+  scaler_type: minmax
+  scaler_range: [-1.0, 1.0]
+  save_scalers_to: experiments/ckpt/scalers
+  num_workers: 6
+  prefetch_files: 4
+  # indices (in *raw* feature order) for lat/lon — used only to build spatial folds
+  lat_feature_index: 5
+  lon_feature_index: 6
+
+model:
+  type: bilstm_attn
+  hidden_size: 256
+  num_layers: 3
+  bidirectional: true
+  dropout: 0.2
+  attention: { type: luong, attn_dim: 256 }
+  layer_norm: true
+
+# NEW: explicit split section
+split:
+  name: random             # random | spatial
+  seed: 42                 # ensures reproducible splits
+  test_split: 0.10         # fraction for *test* holdout (kept fixed across runs)
+  val_split: 0.10          # fraction for *validation* (from remaining train pool)
+  spatial:
+    n_splits: 10           # used when name=spatial
+    fold_index: 0          # which fold is test (0..n_splits-1)
+
+train:
+  device: cuda
+  mixed_precision: true
+  epochs: 100
+  batch_size: 256
+  grad_clip_norm: 1.0
+  optimizer: { name: adam, lr: 1.0e-3, weight_decay: 0.0 }
+  scheduler: { name: exponential, gamma: 0.98 }
+  early_stopping: { patience: 30 }
+
+logging:
+  tensorboard: true
+  log_every_steps: 50
+  run_name: \${project.name}_\${data.start_date}_\${data.end_date}_\${split.name}
+  save_epoch_csv: true
+  epoch_csv: \${project.results_dir}/train_\${data.start_date}_\${data.end_date}_\${split.name}.epochs.csv
+  save_step_csv: false
+  step_csv_every_n: 50
+  step_csv: \${project.results_dir}/train_\${data.start_date}_\${data.end_date}_\${split.name}.steps.csv
+
+
+eval:
+  save_val_predictions: true
+  out_csv_val: \${project.results_dir}/val_\${data.start_date}_\${data.end_date}_\${split.name}.csv
+  out_csv_test: \${project.results_dir}/test_\${data.start_date}_\${data.end_date}_\${split.name}.csv
