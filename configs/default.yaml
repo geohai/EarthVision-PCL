@@ -18,7 +18,7 @@ data:
   scaler_type: minmax
   scaler_range: [-1.0, 1.0]
   save_scalers_to: experiments/ckpt/scalers
-  num_workers: 6
+  num_workers: 4
   prefetch_files: 4
   # indices (in *raw* feature order) for lat/lon — used only to build spatial folds
   lat_feature_index: 5
@@ -56,15 +56,15 @@ train:
 logging:
   tensorboard: true
   log_every_steps: 50
-  run_name: \${project.name}_\${data.start_date}_\${data.end_date}_\${split.name}
+  run_name: ${project.name}_${data.start_date}_${data.end_date}_${split.name}
   save_epoch_csv: true
-  epoch_csv: \${project.results_dir}/train_\${data.start_date}_\${data.end_date}_\${split.name}.epochs.csv
+  epoch_csv: ${project.results_dir}/train_${data.start_date}_${data.end_date}_${split.name}.epochs.csv
   save_step_csv: false
   step_csv_every_n: 50
-  step_csv: \${project.results_dir}/train_\${data.start_date}_\${data.end_date}_\${split.name}.steps.csv
+  step_csv: ${project.results_dir}/train_${data.start_date}_${data.end_date}_${split.name}.steps.csv
 
 
 eval:
   save_val_predictions: true
-  out_csv_val: \${project.results_dir}/val_\${data.start_date}_\${data.end_date}_\${split.name}.csv
-  out_csv_test: \${project.results_dir}/test_\${data.start_date}_\${data.end_date}_\${split.name}.csv
+  out_csv_val: ${project.results_dir}/val_${data.start_date}_${data.end_date}_${split.name}.csv
+  out_csv_test: ${project.results_dir}/test_${data.start_date}_${data.end_date}_${split.name}.csv
