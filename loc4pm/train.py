@@ -199,7 +199,7 @@ def run(cfg_path: str, overrides=None):
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     # hash the key parts of cfg so we can tell hyperparam variants apart
     keyparts = {k: cfg[k] for k in ('model', 'train', 'data', 'split') if k in cfg}
-    h = hashlib.md5(json.dumps(keyparts, sort_keys=True).encode()).hexdigest()[:8]
+    h = hashlib.md5(json.dumps(keyparts, sort_keys=True, default=str).encode()).hexdigest()[:8]
     run_id = f"{cfg['project']['name']}_{cfg['data']['start_date']}_{cfg['data']['end_date']}_{cfg['split']['name']}_{ts}_j{job_id}_{h}"
 
     # ---- Derive run-scoped directories ----

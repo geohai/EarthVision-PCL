@@ -35,7 +35,7 @@ model:
 
 # NEW: explicit split section
 split:
-  name: random             # random | spatial
+  name: spatial             # random | spatial
   seed: 42                 # ensures reproducible splits
   test_split: 0.10         # fraction for *test* holdout (kept fixed across runs)
   val_split: 0.10          # fraction for *validation* (from remaining train pool)

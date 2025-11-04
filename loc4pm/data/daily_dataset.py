@@ -97,6 +97,15 @@ class DailyTSDataset(Dataset):
             if y.ndim == 1:
                 y = y.reshape(-1,1)
             N, T, F = X.shape
+
+            # record mapping + coords (if indices provided)
+            if self.lat_idx is not None and self.lon_idx is not None and self.lat_idx < F and self.lon_idx < F:
+                latvec = X[:, 0, self.lat_idx]
+                lonvec = X[:, 0, self.lon_idx]
+            else:
+                latvec = np.full((N,), np.nan, dtype=float)
+                lonvec = np.full((N,), np.nan, dtype=float)
+
             if self.keep_feat_idx is None:
                 self.keep_feat_idx = [i for i in range(F) if i not in self.drop_idxs]
             Xk = X[:,:, self.keep_feat_idx]
@@ -111,14 +120,6 @@ class DailyTSDataset(Dataset):
             if valid_idx.size:
                 x_scaler.fit_x_chunk(Xk[valid_idx])
                 y_scaler.fit_y_chunk(y[valid_idx])
-
-            # record mapping + coords (if indices provided)
-            if self.lat_idx is not None and self.lon_idx is not None and self.lat_idx < F and self.lon_idx < F:
-                latvec = X[:, 0, self.lat_idx]
-                lonvec = X[:, 0, self.lon_idx]
-            else:
-                latvec = np.full((N,), np.nan, dtype=float)
-                lonvec = np.full((N,), np.nan, dtype=float)
 
             for rid in valid_idx:
                 index_map.append((fid, int(rid)))
