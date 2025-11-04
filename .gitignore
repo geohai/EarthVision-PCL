@@ -1,0 +1,88 @@
+# ---- Python basics
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Packaging / build
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Envs
+.env
+.venv/
+venv/
+env/
+.conda/
+conda-meta/
+
+# Editors / OS
+.vscode/
+.idea/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Lint/test caches & coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.cache/
+.coverage
+htmlcov/
+
+# ---- Project outputs (don’t version logs/artifacts)
+experiments/
+!experiments/.gitkeep          # keep the folder in git, ignore its contents
+logs/
+runs/
+ckpt/
+wandb/
+tensorboard/
+tb/
+lightning_logs/
+mlruns/
+ray_results/
+checkpoints/
+ckpt/
+*.ckpt
+*.pt
+*.log
+
+# Slurm & HPC miscellany
+slurm-*.out
+slurm-*.err
+*.out
+*.err
+core.*
+*.core
+
+# ---- Data & big binaries (top-level only; safe for your code at loc4pm/data/)
+data/
+datasets/
+*.parquet
+*.feather
+*.csv.gz
+*.nc
+*.tif
+*.tiff
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pt
+*.pth
+*.onnx
+*.pb
+*.zip
+*.tar
+*.tar.gz
