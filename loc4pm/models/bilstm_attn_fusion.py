@@ -222,24 +222,28 @@ class BiLSTMAttnLocRegressor(nn.Module):
             loc_out_dim = self.loc_encoder.output_dim
         else:
             loc_out_dim = 0
-        # Determine fusion method and resulting fused dimension
+        # 1) Temporal context dimension (BiLSTM output per time step)
+        self.ts_ctx_dim = hidden_size * (2 if bidirectional else 1)
+
+        # 2) Location embedding dimension after optional projection
+        loc_dim = loc_proj_dim if loc_proj_dim is not None else loc_emb_dim
+        # 3) Fused dimension
         fm = fusion_method.lower() if fusion_method else 'concat'
-        if fm not in ('concat', 'hadamard'):
-            raise ValueError(f"Unsupported fusion_method '{fusion_method}', choose 'concat' or 'hadamard'")
-        self.fusion_method = fm
-        # In the Hadamard case, require that location and attention dims match
-        if fm == 'hadamard' and loc_out_dim > 0:
-            if attn_dim != loc_out_dim:
+        if fm == 'concat':
+            fused_in = self.ts_ctx_dim + loc_dim
+        elif fm == 'hadamard':
+            if loc_dim != self.ts_ctx_dim:
                 raise ValueError(
-                    f"Hadamard fusion requires equal dimensions for context ({attn_dim}) and location ({loc_out_dim})"
+                    f"Hadamard fusion requires equal dims: ts={self.ts_ctx_dim}, loc={loc_dim}. "
+                    "Set model.location.proj_dim to match ts_ctx_dim."
                 )
-            fused_dim = attn_dim
+            fused_in = self.ts_ctx_dim
         else:
-            fused_dim = attn_dim + loc_out_dim
+            raise ValueError(f"Unknown fusion method: {fusion}")
+        self.fusion_method = fm
         # Regression head: map fused representation to a scalar via a hidden layer
         self.head = nn.Sequential(
-            nn.Dropout(dropout),
-            nn.Linear(fused_dim, fusion_hidden_dim),
+            nn.Linear(fused_in, fusion_hidden_dim),
             nn.ReLU(),
             nn.Linear(fusion_hidden_dim, 1)
         )
