@@ -8,6 +8,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .data.daily_dataset import DailyTSDataset
 from .models.bilstm_attn import BiLSTMAttnRegressor
+# Import the location-aware BiLSTM regressor. If the user does not request
+# a location encoder, this class will not be used.
+from .models.bilstm_attn_fusion import BiLSTMAttnLocRegressor
 from .utils.export import save_predictions_and_metrics
 from .utils.splits import random_holdout_indices, spatial_fold_indices
 import contextlib
@@ -36,29 +39,29 @@ def _expand_all_strings(obj, cfg):
     return obj
 
 def _expand_placeholders(s: str, cfg: dict) -> str:
-  if not isinstance(s, str):
-    return s
-  pat = re.compile(r"\\$\\{([^}]+)\\}")
-  def repl(m):
-    key = m.group(1)
-    try:
-      return str(_deep_get(cfg, key))
-    except Exception:
-      return m.group(0)  # leave as-is if missing
-  return pat.sub(repl, s)
+    if not isinstance(s, str):
+        return s
+    pat = re.compile(r"\$\{([^}]+)\}")
+    def repl(m):
+        key = m.group(1)
+        try:
+            return str(_deep_get(cfg, key))
+        except Exception:
+            return m.group(0)  # leave as-is if missing
+    return pat.sub(repl, s)
 
 def _expand_cfg_strings(cfg: dict):
-  if 'logging' in cfg and 'run_name' in cfg['logging']:
-    cfg['logging']['run_name'] = _expand_placeholders(cfg['logging']['run_name'], cfg)
-  # expand any optional CSV log paths
-  if 'logging' in cfg:
-    for k in ('epoch_csv','step_csv'):
-      if k in cfg['logging']:
-        cfg['logging'][k] = _expand_placeholders(cfg['logging'][k], cfg)
-  if 'eval' in cfg:
-    for k in ('out_csv_val','out_csv_test'):
-      if k in cfg['eval']:
-        cfg['eval'][k] = _expand_placeholders(cfg['eval'][k], cfg)
+    if 'logging' in cfg and 'run_name' in cfg['logging']:
+        cfg['logging']['run_name'] = _expand_placeholders(cfg['logging']['run_name'], cfg)
+    # expand any optional CSV log paths
+    if 'logging' in cfg:
+        for k in ('epoch_csv','step_csv'):
+            if k in cfg['logging']:
+                cfg['logging'][k] = _expand_placeholders(cfg['logging'][k], cfg)
+    if 'eval' in cfg:
+        for k in ('out_csv_val','out_csv_test'):
+            if k in cfg['eval']:
+                cfg['eval'][k] = _expand_placeholders(cfg['eval'][k], cfg)
 
 
 def _parse_overrides(pairs):
@@ -100,6 +103,26 @@ def _apply_overrides(cfg, updates):
 
 
 def make_dataset(cfg):
+    """Instantiate the DailyTSDataset and persist scalers.
+
+    This helper inspects the model's location configuration to determine
+    whether geographic coordinates and/or month indices should be returned
+    alongside the time-series inputs. When a location encoder is enabled
+    (``cfg['model']['location']['name']`` not "none"), the dataset is
+    instructed to return latitude/longitude and, for monthly variants of
+    Climplicit, the corresponding month index as well.
+
+    The dataset scalers are saved to disk for later inverse transformations.
+    """
+    # Determine whether we need to return coordinates/month for location fusion
+    loc_cfg = cfg.get('model', {}).get('location', {}) or {}
+    loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
+    # If a location encoder is specified (not 'none' or empty), request coords
+    return_coords = bool(loc_name and loc_name not in ('none', ''))
+    # Request month index only when using a monthly variant
+    loc_variant = str(loc_cfg.get('variant', '') or '').lower()
+    return_month = return_coords and loc_variant == 'monthly'
+
     ds = DailyTSDataset(
         root = cfg['data']['root'],
         start_date = cfg['data']['start_date'],
@@ -113,6 +136,8 @@ def make_dataset(cfg):
         prefetch_files       = cfg['data'].get('prefetch_files', 4),
         lat_feature_index    = cfg['data'].get('lat_feature_index', None),
         lon_feature_index    = cfg['data'].get('lon_feature_index', None),
+        return_coords=return_coords,
+        return_month=return_month,
     )
 
     # persist scalers for later inverse-transform
@@ -152,6 +177,14 @@ def make_splits(cfg, ds):
 
 
 def make_loaders(cfg, ds, train_idx, val_idx, device):
+    """Construct data loaders for training and validation.
+
+    This helper returns PyTorch DataLoader objects for the training and
+    validation subsets as well as the inferred input dimensionality.
+    The input size is derived from the first element of the first batch,
+    accommodating datasets that optionally return additional fields
+    (e.g., coordinates or month indices).
+    """
     num_workers = int(cfg['data']['num_workers'])
     train_set = Subset(ds, train_idx)
     train_loader = DataLoader(train_set, batch_size=cfg['train']['batch_size'], shuffle=True,
@@ -164,20 +197,70 @@ def make_loaders(cfg, ds, train_idx, val_idx, device):
     else:
         val_loader = None
 
-    # infer input size from a sample
-    x0, _ = next(iter(train_loader))
+    # infer input size from a sample (first element of the batch)
+    first_batch = next(iter(train_loader))
+    # In case the dataset returns a tuple (x, coords, [month,] y), the feature
+    # tensor is always the first element. When the dataset returns only (x,y),
+    # first_batch will be a tuple of length 2.
+    if isinstance(first_batch, (list, tuple)):
+        x0 = first_batch[0]
+    else:
+        x0 = first_batch
     input_size = x0.shape[-1]
     return train_loader, val_loader, input_size
 
 
-def evaluate(loader, model, device, loss_fn):
+def evaluate(loader, model, device, loss_fn, *, use_location: bool = False, return_month: bool = False):
+    """Evaluate the model on a data loader.
+
+    This function handles both the baseline BiLSTM model and the
+    location-aware variant. When ``use_location`` is True, the loader
+    is expected to yield tuples containing the time-series tensor, the
+    coordinates tensor, and optionally the month tensor followed by the
+    target. Otherwise, each batch yields a pair (x, y).
+
+    Args:
+        loader: DataLoader providing validation or test batches.
+        model: The PyTorch model to evaluate.
+        device: The torch.device on which computations are performed.
+        loss_fn: Loss function used to compute per-batch loss.
+        use_location: Whether the model expects location inputs.
+        return_month: Whether the loader yields a month index along with coords.
+
+    Returns:
+        A tuple (mean_loss, y_pred, y_true) with numpy arrays for
+        predictions and ground truth.
+    """
     model.eval()
     losses, y_pred, y_true = [], [], []
     with torch.no_grad():
-        for x, y in loader:
+        for batch in loader:
+            # Extract fields from the batch depending on the dataset format
+            if not use_location:
+                # Baseline: batch is (x, y)
+                x, y = batch
+                coords = None
+                month = None
+            else:
+                # With location: batch may be (x, coords, y) or (x, coords, month, y)
+                # DataLoader's default collate wraps items in a tuple
+                if return_month:
+                    x, coords, month, y = batch
+                else:
+                    x, coords, y = batch
+                    month = None
+            # Move tensors to device
             x = x.to(device)
             y = y.to(device).squeeze(-1)
-            yhat, _ = model(x, mask=None)
+            if coords is not None:
+                coords = coords.to(device)
+            if month is not None:
+                month = month.to(device)
+            # Forward pass
+            if use_location:
+                yhat, _ = model(x, coords, month)
+            else:
+                yhat, _ = model(x, mask=None)
             loss = loss_fn(yhat, y).item()
             losses.append(loss)
             y_pred.append(yhat.detach().cpu().numpy())
@@ -246,16 +329,44 @@ def run(cfg_path: str, overrides=None):
     train_idx, val_idx, test_idx = make_splits(cfg, ds)
     train_loader, val_loader, input_size = make_loaders(cfg, ds, train_idx, val_idx, device)
 
-    model = BiLSTMAttnRegressor(
-        input_size=input_size,
-        hidden_size=cfg['model']['hidden_size'],
-        num_layers=cfg['model']['num_layers'],
-        bidirectional=cfg['model']['bidirectional'],
-        dropout=cfg['model']['dropout'],
-        layer_norm=cfg['model']['layer_norm'],
-        attn_type=cfg['model']['attention']['type'],
-        attn_dim=cfg['model']['attention']['attn_dim']
-    ).to(device)
+    # Determine whether to instantiate the location-aware regressor
+    loc_cfg = cfg.get('model', {}).get('location', {}) or {}
+    loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
+    use_location = bool(loc_name and loc_name not in ('none', ''))
+    loc_variant = str(loc_cfg.get('variant', '') or '').lower()
+    return_month = use_location and loc_variant == 'monthly'
+    if use_location:
+        # Build location-aware regressor with appropriate arguments
+        model = BiLSTMAttnLocRegressor(
+            input_size=input_size,
+            hidden_size=cfg['model']['hidden_size'],
+            num_layers=cfg['model']['num_layers'],
+            bidirectional=cfg['model']['bidirectional'],
+            dropout=cfg['model']['dropout'],
+            layer_norm=cfg['model']['layer_norm'],
+            attn_type=cfg['model']['attention']['type'],
+            attn_dim=cfg['model']['attention']['attn_dim'],
+            loc_name=loc_cfg.get('name'),
+            loc_variant=loc_cfg.get('variant'),
+            loc_emb_dim=loc_cfg.get('emb_dim'),
+            loc_pretrained=bool(loc_cfg.get('pretrained', True)),
+            loc_freeze=bool(loc_cfg.get('freeze', True)),
+            loc_proj_dim=loc_cfg.get('proj_dim'),
+            fusion_method=loc_cfg.get('fusion', 'concat'),
+            fusion_hidden_dim=loc_cfg.get('head_hidden_dim', cfg['model']['attention']['attn_dim'])
+        ).to(device)
+    else:
+        # Baseline model without location fusion
+        model = BiLSTMAttnRegressor(
+            input_size=input_size,
+            hidden_size=cfg['model']['hidden_size'],
+            num_layers=cfg['model']['num_layers'],
+            bidirectional=cfg['model']['bidirectional'],
+            dropout=cfg['model']['dropout'],
+            layer_norm=cfg['model']['layer_norm'],
+            attn_type=cfg['model']['attention']['type'],
+            attn_dim=cfg['model']['attention']['attn_dim']
+        ).to(device)
 
     opt = torch.optim.Adam(model.parameters(), lr=cfg['train']['optimizer']['lr'],
                            weight_decay=cfg['train']['optimizer']['weight_decay'])
@@ -302,16 +413,36 @@ def run(cfg_path: str, overrides=None):
         model.train()
         tr_losses = []
         seen = 0
-        for i, (x, y) in enumerate(train_loader):
+        for i, batch in enumerate(train_loader):
+            # Extract batch fields based on the model configuration
+            if not use_location:
+                # Expect (x, y)
+                x, y = batch
+                coords = None
+                month_t = None
+            else:
+                # Expect (x, coords, [month,] y)
+                if return_month:
+                    x, coords, month_t, y = batch
+                else:
+                    x, coords, y = batch
+                    month_t = None
             bs = x.shape[0]
             seen += bs
             total_seen += bs
             x = x.to(device)
             y = y.to(device).squeeze(-1)
+            if coords is not None:
+                coords = coords.to(device)
+            if month_t is not None:
+                month_t = month_t.to(device)
             opt.zero_grad(set_to_none=True)
             if scaler.is_enabled():
                 with amp_autocast():
-                    yhat, _ = model(x, mask=None)
+                    if use_location:
+                        yhat, _ = model(x, coords, month_t)
+                    else:
+                        yhat, _ = model(x, mask=None)
                     loss = loss_fn(yhat, y)
                 scaler.scale(loss).backward()
                 if cfg['train']['grad_clip_norm'] is not None:
@@ -320,7 +451,10 @@ def run(cfg_path: str, overrides=None):
                 scaler.step(opt)
                 scaler.update()
             else:
-                yhat, _ = model(x, mask=None)
+                if use_location:
+                    yhat, _ = model(x, coords, month_t)
+                else:
+                    yhat, _ = model(x, mask=None)
                 loss = loss_fn(yhat, y)
                 loss.backward()
                 if cfg['train']['grad_clip_norm'] is not None:
@@ -350,7 +484,8 @@ def run(cfg_path: str, overrides=None):
 
         # validate (if we have a val split)
         if val_loader is not None:
-            val_loss, y_pred_val, y_true_val = evaluate(val_loader, model, device, loss_fn)
+            val_loss, y_pred_val, y_true_val = evaluate(val_loader, model, device, loss_fn,
+                                                       use_location=use_location, return_month=return_month)
             log.info(f"Epoch {epoch:03d} | val_loss={val_loss:.5f}")
             if save_epoch_csv:
                 _append_csv_row(epoch_csv_path, {
@@ -396,7 +531,8 @@ def run(cfg_path: str, overrides=None):
         out_csv = cfg['eval']['out_csv_val']
         mets_json = os.path.splitext(out_csv)[0] + '.metrics.json'
         ysc_path = os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib')
-        _val_loss, y_pred_val, y_true_val = evaluate(val_loader, model, device, loss_fn)
+        _val_loss, y_pred_val, y_true_val = evaluate(val_loader, model, device, loss_fn,
+                                                     use_location=use_location, return_month=return_month)
         mets = save_predictions_and_metrics(y_true_val, y_pred_val, ysc_path, out_csv, mets_json)
         print('Validation metrics:', json.dumps(mets, indent=2))
         log.info("Validation metrics:\n%s", json.dumps(mets, indent=2))
@@ -405,7 +541,8 @@ def run(cfg_path: str, overrides=None):
     if test_idx.size > 0:
         test_loader = DataLoader(Subset(ds, test_idx), batch_size=cfg['train']['batch_size'], shuffle=False,
                                  num_workers=int(cfg['data']['num_workers']), pin_memory=True, drop_last=False)
-        _t_loss, y_pred_t, y_true_t = evaluate(test_loader, model, device, loss_fn)
+        _t_loss, y_pred_t, y_true_t = evaluate(test_loader, model, device, loss_fn,
+                                              use_location=use_location, return_month=return_month)
         out_csv_t = cfg['eval']['out_csv_test']
         mets_json_t = os.path.splitext(out_csv_t)[0] + '.metrics.json'
         ysc_path = os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib')

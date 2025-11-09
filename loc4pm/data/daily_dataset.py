@@ -73,7 +73,10 @@ class DailyTSDataset(Dataset):
                  scaler_range = (-1.0, 1.0),
                  prefetch_files: int = 4,
                  lat_feature_index: int = None,
-                 lon_feature_index: int = None):
+                 lon_feature_index: int = None,
+                 *,
+                 return_coords: bool = False,
+                 return_month: bool = False):
         self.root = root
         self.dates = iter_dates(start_date, end_date)
         self.pairs = discover_pairs(root, self.dates, x_prefix, y_prefix)
@@ -84,6 +87,12 @@ class DailyTSDataset(Dataset):
         self.lat_idx = lat_feature_index
         self.lon_idx = lon_feature_index
 
+        # Flags to control whether geographic coordinates and month indices are returned from
+        # __getitem__. When enabled, the __getitem__ signature changes to include these
+        # auxiliary fields before the target value.
+        self.return_coords = bool(return_coords)
+        self.return_month = bool(return_month)
+
         self.keep_feat_idx = None
         self.file_meta: List[Dict] = []
         x_scaler = MinMaxScalerLite(feature_range=scaler_range)
@@ -91,6 +100,7 @@ class DailyTSDataset(Dataset):
 
         index_map = []
         coords = []
+        months = []
         for fid, (xp, yp) in enumerate(self.pairs):
             X = np.load(xp)  # [N,T,F]
             y = np.load(yp)  # [N] or [N,1]
@@ -124,6 +134,13 @@ class DailyTSDataset(Dataset):
             for rid in valid_idx:
                 index_map.append((fid, int(rid)))
                 coords.append((float(latvec[rid]), float(lonvec[rid])))
+                # compute the month (1-12) corresponding to this file/date
+                try:
+                    date_str = self.dates[fid]
+                    m = int(date_str.split("-")[1])
+                except Exception:
+                    m = 1
+                months.append(m)
 
             self.file_meta.append({
                 'x_path': xp,
@@ -139,6 +156,7 @@ class DailyTSDataset(Dataset):
         self.y_scaler = y_scaler
         self.index_map = index_map
         self.coords = np.asarray(coords, dtype=float)  # shape [M,2]
+        self.months = np.asarray(months, dtype=int)
 
         self._cache: Dict[str, np.ndarray] = {}
         self._cache_order: List[str] = []
@@ -166,6 +184,17 @@ class DailyTSDataset(Dataset):
             y = y.reshape(-1,1)
         x_row = X[rid][:, self.keep_feat_idx]
         y_row = y[rid].astype(np.float32)
+        # scale inputs/target
         x_row = self.x_scaler.transform_x(x_row).astype(np.float32)
         y_row = self.y_scaler.transform_y(y_row).astype(np.float32)
-        return x_row, y_row
+        # When neither coords nor month are requested, preserve the original API
+        if not self.return_coords and not self.return_month:
+            return x_row, y_row
+        # build output tuple dynamically
+        out = [x_row]
+        if self.return_coords:
+            out.append(self.coords[idx].astype(np.float32))
+        if self.return_month:
+            out.append(self.months[idx].astype(np.int64))
+        out.append(y_row)
+        return tuple(out)
