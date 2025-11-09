@@ -4,6 +4,7 @@ __pycache__/
 *.pyo
 *.pyd
 *.so
+*.pyc
 
 # Packaging / build
 *.egg-info/
@@ -53,6 +54,7 @@ lightning_logs/
 mlruns/
 ray_results/
 checkpoints/
+ckpt/scalers
 ckpt/
 *.ckpt
 *.pt
