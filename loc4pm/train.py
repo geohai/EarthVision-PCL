@@ -226,7 +226,6 @@ def make_scheduler(opt, cfg):
             threshold_mode=sc.get('threshold_mode', 'abs'),
             cooldown=int(sc.get('cooldown', 0)),
             min_lr=float(sc.get('min_lr', 4e-5)),
-            verbose=bool(sc.get('verbose', True)),
         )
     return None
 
@@ -392,7 +391,7 @@ def run(cfg_path: str, overrides=None):
     opt = torch.optim.Adam(model.parameters(), lr=cfg['train']['optimizer']['lr'],
                            weight_decay=cfg['train']['optimizer']['weight_decay'])
     sched = make_scheduler(opt, cfg)
-
+    print(f"Scheduler = {type(sched).__name__ if sched else None}")
 
     loss_fn = nn.HuberLoss()
     use_amp = bool(cfg['train']['mixed_precision'] and device.type=='cuda')
