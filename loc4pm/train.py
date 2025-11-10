@@ -209,6 +209,27 @@ def make_loaders(cfg, ds, train_idx, val_idx, device):
     input_size = x0.shape[-1]
     return train_loader, val_loader, input_size
 
+def make_scheduler(opt, cfg):
+    sc = cfg['train'].get('scheduler', {})
+    name = sc.get('name', 'none').lower()
+    if name == 'exponential':
+        return torch.optim.lr_scheduler.ExponentialLR(
+            opt, gamma=float(sc.get('gamma', 0.98))
+        )
+    if name == 'reduce_on_plateau':
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode=sc.get('mode', 'min'),
+            factor=float(sc.get('factor', 0.5)),
+            patience=int(sc.get('patience', 5)),
+            threshold=float(sc.get('threshold', 1e-6)),
+            threshold_mode=sc.get('threshold_mode', 'abs'),
+            cooldown=int(sc.get('cooldown', 0)),
+            min_lr=float(sc.get('min_lr', 4e-5)),
+            verbose=bool(sc.get('verbose', True)),
+        )
+    return None
+
 
 def evaluate(loader, model, device, loss_fn, *, use_location: bool = False, return_month: bool = False):
     """Evaluate the model on a data loader.
@@ -370,8 +391,8 @@ def run(cfg_path: str, overrides=None):
 
     opt = torch.optim.Adam(model.parameters(), lr=cfg['train']['optimizer']['lr'],
                            weight_decay=cfg['train']['optimizer']['weight_decay'])
-    sched = torch.optim.lr_scheduler.ExponentialLR(opt, gamma=float(cfg['train']['scheduler']['gamma'])) \
-            if cfg['train']['scheduler']['name'] == 'exponential' else None
+    sched = make_scheduler(opt, cfg)
+
 
     loss_fn = nn.HuberLoss()
     use_amp = bool(cfg['train']['mixed_precision'] and device.type=='cuda')
@@ -509,8 +530,12 @@ def run(cfg_path: str, overrides=None):
                 os.makedirs(cfg['project']['ckpt_dir'], exist_ok=True)
                 torch.save({'model': model.state_dict(), 'cfg': cfg, 'epoch': epoch},
                            os.path.join(run_ckpt_dir, 'best.pt'))
+            # after validation
             if sched is not None:
-                sched.step()
+                if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    sched.step(val_loss)  # needs the metric
+                else:
+                    sched.step()  # e.g., ExponentialLR
             if epoch - best_epoch >= patience:
                 log.info(f"Early stopping at epoch {epoch} (best {best_epoch}, val {best_val:.4f})")
                 break

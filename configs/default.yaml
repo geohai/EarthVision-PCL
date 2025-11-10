@@ -7,8 +7,8 @@ project:
   results_dir: experiments/results
 
 data:
-  root: /ocean/projects/cis250170p/zwang63/data/loc4pm/processed/EO_NCAR_merged_maxslope
-#  root: /home/zhongying/Documents/loc4pm/dataset/EO_NCAR_merged_maxslope/ # Local Root
+#  root: /ocean/projects/cis250170p/zwang63/data/loc4pm/processed/EO_NCAR_merged_maxslope
+  root: /home/zhongying/Documents/loc4pm/dataset/EO_NCAR_merged_maxslope/ # Local Root
   start_date: 2017-02-01
   end_date:   2018-12-31
   x_prefix: TS_X_
@@ -43,9 +43,9 @@ model:
   # ``proj_dim`` is provided and differs from ``emb_dim``, the location
   # embeddings will be projected to this dimensionality prior to fusion.
   location:
-    name: climplicit            # climplicit | geoclip | satclip | none
+    name: geoclip            # climplicit | geoclip | satclip | none
     variant: monthly      # monthly | annual (only for climplicit)
-    emb_dim: 256          # raw embedding dimension of the location encoder
+    emb_dim: 512          # raw embedding dimension of the location encoder
     pretrained: true       # whether to load pretrained weights if available
     freeze: true           # whether to freeze the location encoder during training
     proj_dim: null         # optional projection dimension; null for no projection
@@ -65,11 +65,22 @@ split:
 train:
   device: cuda
   mixed_precision: true
-  epochs: 1
+  epochs: 100
   batch_size: 256
   grad_clip_norm: 1.0
-  optimizer: { name: adam, lr: 1.0e-3, weight_decay: 0.0 }
-  scheduler: { name: exponential, gamma: 0.98 }
+  optimizer: { name: adam, lr: 3.0e-4, weight_decay: 1.0e-5 }
+  scheduler:
+    scheduler:
+      name: exponential #reduce_on_plateau
+      gamma: 0.98
+#      mode: min
+#      factor: 0.5
+#      patience: 5
+#      threshold: 1.0e-6
+#      threshold_mode: abs      # or 'rel' if you prefer relative tolerance
+#      cooldown: 0
+#      min_lr: 4.0e-5
+#      verbose: true
   early_stopping: { patience: 30 }
 
 logging:
