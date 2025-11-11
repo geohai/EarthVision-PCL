@@ -1,4 +1,4 @@
-import os, yaml, json, joblib, time, datetime, hashlib, logging, re
+import os, yaml, json, joblib, time, datetime, hashlib, logging, re, contextlib
 import pandas as pd
 import numpy as np
 import torch
@@ -8,14 +8,13 @@ from torch.utils.tensorboard import SummaryWriter
 
 from .data.daily_dataset import DailyTSDataset
 from .models.bilstm_attn import BiLSTMAttnRegressor
-# Import the location-aware BiLSTM regressor. If the user does not request
-# a location encoder, this class will not be used.
 from .models.bilstm_attn_fusion import BiLSTMAttnLocRegressor
 from .utils.export import save_predictions_and_metrics
 from .utils.splits import random_holdout_indices, spatial_fold_indices
-import contextlib
 
 _PAT = re.compile(r"\$\{([^}]+)\}")
+
+# ------------------------------- helpers ---------------------------------- #
 
 def _deep_get(dic, dotted):
     cur = dic
@@ -47,13 +46,12 @@ def _expand_placeholders(s: str, cfg: dict) -> str:
         try:
             return str(_deep_get(cfg, key))
         except Exception:
-            return m.group(0)  # leave as-is if missing
+            return m.group(0)
     return pat.sub(repl, s)
 
 def _expand_cfg_strings(cfg: dict):
     if 'logging' in cfg and 'run_name' in cfg['logging']:
         cfg['logging']['run_name'] = _expand_placeholders(cfg['logging']['run_name'], cfg)
-    # expand any optional CSV log paths
     if 'logging' in cfg:
         for k in ('epoch_csv','step_csv'):
             if k in cfg['logging']:
@@ -62,7 +60,6 @@ def _expand_cfg_strings(cfg: dict):
         for k in ('out_csv_val','out_csv_test'):
             if k in cfg['eval']:
                 cfg['eval'][k] = _expand_placeholders(cfg['eval'][k], cfg)
-
 
 def _parse_overrides(pairs):
     def cast(v):
@@ -86,7 +83,6 @@ def _parse_overrides(pairs):
         kv[pairs[i]] = cast(pairs[i+1])
     return kv
 
-
 def _nested_set(dic, keys, value):
     ks = keys.split('.')
     cur = dic
@@ -96,56 +92,51 @@ def _nested_set(dic, keys, value):
         cur = cur[k]
     cur[ks[-1]] = value
 
-
 def _apply_overrides(cfg, updates):
     for k, v in updates.items():
         _nested_set(cfg, k, v)
 
+# -------------------------- data + scheduler ------------------------------ #
 
 def make_dataset(cfg):
-    """Instantiate the DailyTSDataset and persist scalers.
-
-    This helper inspects the model's location configuration to determine
-    whether geographic coordinates and/or month indices should be returned
-    alongside the time-series inputs. When a location encoder is enabled
-    (``cfg['model']['location']['name']`` not "none"), the dataset is
-    instructed to return latitude/longitude and, for monthly variants of
-    Climplicit, the corresponding month index as well.
-
-    The dataset scalers are saved to disk for later inverse transformations.
-    """
-    # Determine whether we need to return coordinates/month for location fusion
+    """Instantiate DailyTSDataset and persist scalers."""
     loc_cfg = cfg.get('model', {}).get('location', {}) or {}
     loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
-    # If a location encoder is specified (not 'none' or empty), request coords
     return_coords = bool(loc_name and loc_name not in ('none', ''))
-    # Request month index only when using a monthly variant
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
     return_month = return_coords and loc_variant == 'monthly'
 
+    data_cfg = cfg['data']
+    # Optional z targets
+    z_feature_indices = data_cfg.get('z_feature_indices', [])
+    z_scaler_range = tuple(data_cfg.get('z_scaler_range', data_cfg.get('scaler_range', (-1.0, 1.0))))
+
     ds = DailyTSDataset(
-        root = cfg['data']['root'],
-        start_date = cfg['data']['start_date'],
-        end_date   = cfg['data']['end_date'],
-        x_prefix   = cfg['data']['x_prefix'],
-        y_prefix   = cfg['data']['y_prefix'],
-        drop_feature_indices = cfg['data']['drop_feature_indices'],
-        filter_y_positive    = cfg['data']['filter_y_positive'],
-        remove_nan_rows      = cfg['data']['remove_nan_rows'],
-        scaler_range         = tuple(cfg['data']['scaler_range']),
-        prefetch_files       = cfg['data'].get('prefetch_files', 4),
-        lat_feature_index    = cfg['data'].get('lat_feature_index', None),
-        lon_feature_index    = cfg['data'].get('lon_feature_index', None),
+        root=data_cfg['root'],
+        start_date=data_cfg['start_date'],
+        end_date=data_cfg['end_date'],
+        x_prefix=data_cfg['x_prefix'],
+        y_prefix=data_cfg['y_prefix'],
+        drop_feature_indices=data_cfg['drop_feature_indices'],
+        filter_y_positive=data_cfg['filter_y_positive'],
+        remove_nan_rows=data_cfg['remove_nan_rows'],
+        scaler_range=tuple(data_cfg['scaler_range']),
+        prefetch_files=data_cfg.get('prefetch_files', 4),
+        lat_feature_index=data_cfg.get('lat_feature_index', None),
+        lon_feature_index=data_cfg.get('lon_feature_index', None),
         return_coords=return_coords,
         return_month=return_month,
+        # NEW for physical head
+        z_feature_indices=z_feature_indices,
+        z_scaler_range=z_scaler_range,
     )
 
-    # persist scalers for later inverse-transform
-    os.makedirs(cfg['data']['save_scalers_to'], exist_ok=True)
-    joblib.dump(ds.x_scaler, os.path.join(cfg['data']['save_scalers_to'], 'X_scaler.joblib'))
-    joblib.dump(ds.y_scaler, os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib'))
+    os.makedirs(data_cfg['save_scalers_to'], exist_ok=True)
+    joblib.dump(ds.x_scaler, os.path.join(data_cfg['save_scalers_to'], 'X_scaler.joblib'))
+    joblib.dump(ds.y_scaler, os.path.join(data_cfg['save_scalers_to'], 'y_scaler.joblib'))
+    if getattr(ds, 'return_z', False) and getattr(ds, 'z_scaler', None) is not None:
+        joblib.dump(ds.z_scaler, os.path.join(data_cfg['save_scalers_to'], 'z_scaler.joblib'))
     return ds
-
 
 def make_splits(cfg, ds):
     n = len(ds)
@@ -155,7 +146,6 @@ def make_splits(cfg, ds):
     test_frac = float(split['test_split'])
     val_frac  = float(split['val_split'])
 
-    # first, carve out TEST indices
     if name == 'random':
         train_pool, test_idx = random_holdout_indices(n, test_frac, seed)
     elif name == 'spatial':
@@ -164,7 +154,6 @@ def make_splits(cfg, ds):
     else:
         raise ValueError(f"Unknown split.name: {name}")
 
-    # then carve out VAL from the remaining train_pool deterministically
     if val_frac > 0:
         tr_idx, val_idx = random_holdout_indices(len(train_pool), val_frac, seed+1)
         train_idx = np.asarray(train_pool)[tr_idx]
@@ -175,21 +164,11 @@ def make_splits(cfg, ds):
 
     return train_idx, val_idx, np.asarray(test_idx)
 
-
 def make_loaders(cfg, ds, train_idx, val_idx, device):
-    """Construct data loaders for training and validation.
-
-    This helper returns PyTorch DataLoader objects for the training and
-    validation subsets as well as the inferred input dimensionality.
-    The input size is derived from the first element of the first batch,
-    accommodating datasets that optionally return additional fields
-    (e.g., coordinates or month indices).
-    """
     num_workers = int(cfg['data']['num_workers'])
     train_set = Subset(ds, train_idx)
     train_loader = DataLoader(train_set, batch_size=cfg['train']['batch_size'], shuffle=True,
                               num_workers=num_workers, pin_memory=(device.type=='cuda'), drop_last=False)
-
     if val_idx.size > 0:
         val_set = Subset(ds, val_idx)
         val_loader = DataLoader(val_set, batch_size=cfg['train']['batch_size'], shuffle=False,
@@ -197,15 +176,8 @@ def make_loaders(cfg, ds, train_idx, val_idx, device):
     else:
         val_loader = None
 
-    # infer input size from a sample (first element of the batch)
     first_batch = next(iter(train_loader))
-    # In case the dataset returns a tuple (x, coords, [month,] y), the feature
-    # tensor is always the first element. When the dataset returns only (x,y),
-    # first_batch will be a tuple of length 2.
-    if isinstance(first_batch, (list, tuple)):
-        x0 = first_batch[0]
-    else:
-        x0 = first_batch
+    x0 = first_batch[0] if isinstance(first_batch, (list, tuple)) else first_batch
     input_size = x0.shape[-1]
     return train_loader, val_loader, input_size
 
@@ -229,64 +201,122 @@ def make_scheduler(opt, cfg):
         )
     return None
 
+# -------------------------- batch / output utils -------------------------- #
 
-def evaluate(loader, model, device, loss_fn, *, use_location: bool = False, return_month: bool = False):
-    """Evaluate the model on a data loader.
+def _split_model_outputs(out):
+    # Accept (yhat, attn) or (yhat, zhat, attn)
+    if isinstance(out, (list, tuple)):
+        if len(out) == 3:
+            yhat, zhat, attn = out
+        elif len(out) == 2:
+            yhat, attn = out
+            zhat = None
+        else:
+            yhat, zhat, attn = out, None, None
+    else:
+        yhat, zhat, attn = out, None, None
+    return yhat, zhat, attn
 
-    This function handles both the baseline BiLSTM model and the
-    location-aware variant. When ``use_location`` is True, the loader
-    is expected to yield tuples containing the time-series tensor, the
-    coordinates tensor, and optionally the month tensor followed by the
-    target. Otherwise, each batch yields a pair (x, y).
-
-    Args:
-        loader: DataLoader providing validation or test batches.
-        model: The PyTorch model to evaluate.
-        device: The torch.device on which computations are performed.
-        loss_fn: Loss function used to compute per-batch loss.
-        use_location: Whether the model expects location inputs.
-        return_month: Whether the loader yields a month index along with coords.
-
-    Returns:
-        A tuple (mean_loss, y_pred, y_true) with numpy arrays for
-        predictions and ground truth.
+def _parse_batch(batch, use_location: bool, return_month: bool, expect_z: bool):
     """
+    Supports tuples: (x, y), (x,z,y), (x,coords,y), (x,coords,z,y),
+                     (x,coords,month,y), (x,coords,month,z,y)
+    """
+    if not isinstance(batch, (list, tuple)):
+        raise RuntimeError("Unexpected batch format")
+    x = batch[0]
+    coords = month_t = z = y = None
+    if not use_location:
+        if expect_z:
+            if len(batch) != 3:
+                raise RuntimeError(f"Expected (x,z,y), got len={len(batch)}")
+            _, z, y = batch
+        else:
+            if len(batch) != 2:
+                raise RuntimeError(f"Expected (x,y), got len={len(batch)}")
+            _, y = batch
+    else:
+        if return_month:
+            if expect_z:
+                if len(batch) != 5:
+                    raise RuntimeError(f"Expected (x,coords,month,z,y), got len={len(batch)}")
+                x, coords, month_t, z, y = batch
+            else:
+                if len(batch) != 4:
+                    raise RuntimeError(f"Expected (x,coords,month,y), got len={len(batch)}")
+                x, coords, month_t, y = batch
+        else:
+            if expect_z:
+                if len(batch) != 4:
+                    raise RuntimeError(f"Expected (x,coords,z,y), got len={len(batch)}")
+                x, coords, z, y = batch
+            else:
+                if len(batch) != 3:
+                    raise RuntimeError(f"Expected (x,coords,y), got len={len(batch)}")
+                x, coords, y = batch
+    return x, coords, month_t, z, y
+
+def _count_params(model):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total, trainable, total - trainable
+
+def _count_params_by_top(model):
+    # aggregate by top-level module name from named_parameters()
+    buckets = {}
+    for name, p in model.named_parameters():
+        top = name.split('.', 1)[0]
+        if top not in buckets:
+            buckets[top] = {'total': 0, 'trainable': 0}
+        n = p.numel()
+        buckets[top]['total'] += n
+        if p.requires_grad:
+            buckets[top]['trainable'] += n
+    return buckets
+
+
+# --------------------------------- eval ----------------------------------- #
+
+def evaluate(loader, model, device, loss_fn, *,
+             use_location: bool = False,
+             return_month: bool = False,
+             return_z: bool = False,
+             loss_weight_physical: float = 0.0):
+    """Evaluate with component losses: returns (mean_total, mean_pred, mean_phys, y_pred, y_true)."""
     model.eval()
-    losses, y_pred, y_true = [], [], []
+    tot_losses, pred_losses, phys_losses = [], [], []
+    y_pred_list, y_true_list = [], []
     with torch.no_grad():
         for batch in loader:
-            # Extract fields from the batch depending on the dataset format
-            if not use_location:
-                # Baseline: batch is (x, y)
-                x, y = batch
-                coords = None
-                month = None
-            else:
-                # With location: batch may be (x, coords, y) or (x, coords, month, y)
-                # DataLoader's default collate wraps items in a tuple
-                if return_month:
-                    x, coords, month, y = batch
-                else:
-                    x, coords, y = batch
-                    month = None
-            # Move tensors to device
-            x = x.to(device)
-            y = y.to(device).squeeze(-1)
-            if coords is not None:
-                coords = coords.to(device)
-            if month is not None:
-                month = month.to(device)
-            # Forward pass
-            if use_location:
-                yhat, _ = model(x, coords, month)
-            else:
-                yhat, _ = model(x, mask=None)
-            loss = loss_fn(yhat, y).item()
-            losses.append(loss)
-            y_pred.append(yhat.detach().cpu().numpy())
-            y_true.append(y.detach().cpu().numpy())
-    return float(np.mean(losses)), np.concatenate(y_pred), np.concatenate(y_true)
+            x, coords, month_t, z, y = _parse_batch(batch, use_location, return_month, expect_z=return_z)
+            x = x.to(device); y = y.to(device).squeeze(-1)
+            coords = coords.to(device) if coords is not None else None
+            month_t = month_t.to(device) if month_t is not None else None
+            z = z.to(device).squeeze(-1) if z is not None else None
 
+            out = model(x, coords, month_t) if use_location else model(x)
+            yhat, zhat, _ = _split_model_outputs(out)
+
+            pred_loss = loss_fn(yhat, y)
+            phys_loss = torch.tensor(0.0, device=device)
+            if return_z and (zhat is not None):
+                zpred = zhat.squeeze(-1)
+                phys_loss = loss_fn(zpred, z)
+
+            loss = pred_loss + loss_weight_physical * phys_loss
+
+            tot_losses.append(loss.item())
+            pred_losses.append(pred_loss.item())
+            phys_losses.append(float(phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss))
+            y_pred_list.append(yhat.detach().cpu().numpy())
+            y_true_list.append(y.detach().cpu().numpy())
+
+    mean_total = float(np.mean(tot_losses)) if tot_losses else float('nan')
+    mean_pred  = float(np.mean(pred_losses)) if pred_losses else float('nan')
+    mean_phys  = float(np.mean(phys_losses)) if phys_losses else 0.0
+    return mean_total, mean_pred, mean_phys, np.concatenate(y_pred_list), np.concatenate(y_true_list)
+
+# --------------------------------- run ------------------------------------ #
 
 def run(cfg_path: str, overrides=None):
     with open(cfg_path, 'r') as f:
@@ -296,26 +326,33 @@ def run(cfg_path: str, overrides=None):
         _apply_overrides(cfg, _parse_overrides(overrides))
 
     cfg = _expand_all_strings(cfg, cfg)
+    _expand_cfg_strings(cfg)
 
-    # ---- Build a robust run_id ----
+    # From-scratch override to ensure location backbones aren't pretrained/frozen.
+    from_scratch = bool(cfg.get('train', {}).get('from_scratch', False))
+    if from_scratch:
+        loc_section = cfg.get('model', {}).get('location', {}) or {}
+        if 'pretrained' in loc_section: loc_section['pretrained'] = False
+        if 'freeze'     in loc_section: loc_section['freeze']     = False
+        cfg.setdefault('model', {}).setdefault('location', {})
+        cfg['model']['location'].update(loc_section)
+
+    # Run ID / dirs
     job_id = os.getenv("SLURM_JOB_ID", "local")
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    # hash the key parts of cfg so we can tell hyperparam variants apart
     keyparts = {k: cfg[k] for k in ('model', 'train', 'data', 'split') if k in cfg}
     h = hashlib.md5(json.dumps(keyparts, sort_keys=True, default=str).encode()).hexdigest()[:8]
     run_id = f"{cfg['project']['name']}_{cfg['data']['start_date']}_{cfg['data']['end_date']}_{cfg['split']['name']}_{ts}_j{job_id}_{h}"
 
-    # ---- Derive run-scoped directories ----
     base_results = cfg['project']['results_dir']
-    base_logs = cfg['project']['log_dir']
-    base_ckpt = cfg['project']['ckpt_dir']
-
+    base_logs    = cfg['project']['log_dir']
+    base_ckpt    = cfg['project']['ckpt_dir']
     run_results_dir = os.path.join(base_results, run_id)
-    run_logs_dir = os.path.join(base_logs, run_id)
-    run_tb_dir = os.path.join(run_logs_dir, "tb")
-    run_ckpt_dir = os.path.join(base_ckpt, run_id)
+    run_logs_dir    = os.path.join(base_logs, run_id)
+    run_tb_dir      = os.path.join(run_logs_dir, "tb")
+    run_ckpt_dir    = os.path.join(base_ckpt, run_id)
 
-    cfg['eval']['out_csv_val'] = os.path.join(run_results_dir, "val.csv")
+    cfg['eval']['out_csv_val']  = os.path.join(run_results_dir, "val.csv")
     cfg['eval']['out_csv_test'] = os.path.join(run_results_dir, "test.csv")
 
     os.makedirs(run_results_dir, exist_ok=True)
@@ -323,7 +360,7 @@ def run(cfg_path: str, overrides=None):
     os.makedirs(run_tb_dir, exist_ok=True)
     os.makedirs(run_ckpt_dir, exist_ok=True)
 
-    # ---- Configure a human-readable text logger with timestamps ----
+    # Logging
     log_path = os.path.join(run_logs_dir, "run.log")
     logging.basicConfig(
         level=logging.INFO,
@@ -335,28 +372,39 @@ def run(cfg_path: str, overrides=None):
     log.info("Job ID: %s", job_id)
     log.info("Saving results to: %s", run_results_dir)
 
-    # ---- Snapshot the resolved config for reproducibility ----
+    # Snapshot cfg
     with open(os.path.join(run_results_dir, "config.resolved.yaml"), "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
     if overrides:
         with open(os.path.join(run_results_dir, "overrides.json"), "w") as f:
             json.dump(_parse_overrides(overrides), f, indent=2)
 
+    # Device
     req_dev = str(cfg['train']['device']).lower()
     device = torch.device('cuda' if (req_dev == 'cuda' and torch.cuda.is_available()) else 'cpu')
 
+    # Data + splits + loaders
     ds = make_dataset(cfg)
     train_idx, val_idx, test_idx = make_splits(cfg, ds)
     train_loader, val_loader, input_size = make_loaders(cfg, ds, train_idx, val_idx, device)
 
-    # Determine whether to instantiate the location-aware regressor
+    # Physical config
+    data_cfg = cfg.get('data', {})
+    z_feature_indices = data_cfg.get('z_feature_indices', [])
+    physical_out_dim = len(z_feature_indices)
+    loss_weight_physical = float(cfg['train'].get('loss_weight_physical', 0.0))
+
+    # Location / model config
     loc_cfg = cfg.get('model', {}).get('location', {}) or {}
     loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
     use_location = bool(loc_name and loc_name not in ('none', ''))
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
     return_month = use_location and loc_variant == 'monthly'
+    physical_head_hidden_dim = cfg['model'].get('physical_head_hidden_dim',
+                                                cfg['model']['attention']['attn_dim'])
+
+    # Build model
     if use_location:
-        # Build location-aware regressor with appropriate arguments
         model = BiLSTMAttnLocRegressor(
             input_size=input_size,
             hidden_size=cfg['model']['hidden_size'],
@@ -373,10 +421,12 @@ def run(cfg_path: str, overrides=None):
             loc_freeze=bool(loc_cfg.get('freeze', True)),
             loc_proj_dim=loc_cfg.get('proj_dim'),
             fusion_method=loc_cfg.get('fusion', 'concat'),
-            fusion_hidden_dim=loc_cfg.get('head_hidden_dim', cfg['model']['attention']['attn_dim'])
+            fusion_hidden_dim=loc_cfg.get('head_hidden_dim', cfg['model']['attention']['attn_dim']),
+            # NEW: physical head
+            physical_head_hidden_dim=physical_head_hidden_dim if physical_out_dim > 0 else None,
+            physical_out_dim=physical_out_dim
         ).to(device)
     else:
-        # Baseline model without location fusion
         model = BiLSTMAttnRegressor(
             input_size=input_size,
             hidden_size=cfg['model']['hidden_size'],
@@ -388,35 +438,66 @@ def run(cfg_path: str, overrides=None):
             attn_dim=cfg['model']['attention']['attn_dim']
         ).to(device)
 
-    opt = torch.optim.Adam(model.parameters(), lr=cfg['train']['optimizer']['lr'],
+    # --- Setup banner ---
+    log.info("---- RUN SETUP ----")
+    log.info("Device: %s | Mixed Precision: %s", device, bool(cfg['train'].get('mixed_precision') and device.type=='cuda'))
+    log.info("Model: BiLSTM+Attn%s", " + LocFusion" if use_location else "")
+    if use_location:
+        log.info("  LocEnc name=%s, variant=%s, emb_dim=%s, proj_dim=%s",
+                 loc_cfg.get('name'), loc_cfg.get('variant'), loc_cfg.get('emb_dim'), loc_cfg.get('proj_dim'))
+        log.info("  pretrained=%s, freeze=%s, fusion=%s, head_hidden_dim=%s",
+                 bool(loc_cfg.get('pretrained', False)), bool(loc_cfg.get('freeze', False)),
+                 loc_cfg.get('fusion', 'concat'), loc_cfg.get('head_hidden_dim'))
+    log.info("Train from scratch: %s", from_scratch)
+    log.info("Physical head: %s (out_dim=%d)", "ENABLED" if physical_out_dim>0 else "DISABLED", physical_out_dim)
+    log.info("Loss weight c (physical): %.4f%s",
+             loss_weight_physical, "  [diagnostic-only]" if loss_weight_physical == 0.0 and physical_out_dim>0 else "")
+
+    # --- Parameter counts ---
+    tot, trn, frz = _count_params(model)
+    log.info("Parameters: total=%s | trainable=%s | frozen=%s",
+             f"{tot:,}", f"{trn:,}", f"{frz:,}")
+    if trn == 0:
+        log.warning("WARNING: 0 trainable parameters detected — check 'pretrained'/'freeze' and from_scratch settings.")
+
+    # Optional breakdown by top-level submodule (useful to confirm loc encoder is trainable)
+    _top = _count_params_by_top(model)
+    for k, v in sorted(_top.items(), key=lambda kv: kv[0]):
+        log.info("  [%s] trainable=%s / total=%s",
+                 k, f"{v['trainable']:,}", f"{v['total']:,}")
+
+    # Optimizer / scheduler / loss
+    opt = torch.optim.Adam(model.parameters(),
+                           lr=cfg['train']['optimizer']['lr'],
                            weight_decay=cfg['train']['optimizer']['weight_decay'])
     sched = make_scheduler(opt, cfg)
-    print(f"Scheduler = {type(sched).__name__ if sched else None}")
+    scfg = cfg['train'].get('scheduler', {})
+    log.info("Optimizer: Adam(lr=%.3e, weight_decay=%.1e)", cfg['train']['optimizer']['lr'], cfg['train']['optimizer']['weight_decay'])
+    log.info("Scheduler: %s %s", scfg.get('name', 'none'),
+             f"(gamma={scfg.get('gamma')})" if scfg.get('name','').lower()=='exponential' else
+             (f"(mode={scfg.get('mode')}, factor={scfg.get('factor')}, patience={scfg.get('patience')})"
+              if scfg.get('name','').lower()=='reduce_on_plateau' else ""))
 
     loss_fn = nn.HuberLoss()
-    use_amp = bool(cfg['train']['mixed_precision'] and device.type=='cuda')
-    # Create GradScaler with compatibility across torch versions
+    use_amp = bool(cfg['train'].get('mixed_precision') and device.type=='cuda')
     try:
         scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
         amp_autocast = (lambda: torch.amp.autocast('cuda')) if use_amp else (lambda: contextlib.nullcontext())
     except TypeError:
-        # Older API (or without device arg)
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)  # older API
         amp_autocast = (lambda: torch.cuda.amp.autocast()) if use_amp else (lambda: contextlib.nullcontext())
 
     writer = SummaryWriter(run_tb_dir) if cfg['logging']['tensorboard'] else None
 
-    # CSV logging setup
-    # CSV paths inside the run directory
+    # CSV logs
     epoch_csv_path = os.path.join(run_results_dir, "train.epochs.csv")
-    step_csv_path = os.path.join(run_results_dir, "train.steps.csv")  # if you use it
+    step_csv_path  = os.path.join(run_results_dir, "train.steps.csv")
     save_epoch_csv = True
-    save_step_csv = False
+    save_step_csv  = False
     step_every = int(cfg['logging'].get('step_csv_every_n', 50))
 
     def _append_csv_row(path: str, row: dict):
-        if not path:
-            return
+        if not path: return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         exists = os.path.exists(path)
         pd.DataFrame([row]).to_csv(path, mode='a', index=False, header=not exists)
@@ -424,161 +505,195 @@ def run(cfg_path: str, overrides=None):
     best_val = float('inf')
     best_epoch = -1
     patience = int(cfg['train']['early_stopping']['patience'])
-    global_step = 0
+
+    # ----------------------------- training -------------------------------- #
 
     train_start = time.perf_counter()
-    total_seen = 0
     for epoch in range(1, cfg['train']['epochs']+1):
         ep_t0 = time.perf_counter()
         model.train()
-        tr_losses = []
+        tr_tot_losses, tr_pred_losses, tr_phys_losses = [], [], []
         seen = 0
+
+        expect_z = (physical_out_dim > 0)
         for i, batch in enumerate(train_loader):
-            # Extract batch fields based on the model configuration
-            if not use_location:
-                # Expect (x, y)
-                x, y = batch
-                coords = None
-                month_t = None
-            else:
-                # Expect (x, coords, [month,] y)
-                if return_month:
-                    x, coords, month_t, y = batch
-                else:
-                    x, coords, y = batch
-                    month_t = None
+            x, coords, month_t, z, y = _parse_batch(batch, use_location, return_month, expect_z=expect_z)
+
             bs = x.shape[0]
             seen += bs
-            total_seen += bs
-            x = x.to(device)
-            y = y.to(device).squeeze(-1)
-            if coords is not None:
-                coords = coords.to(device)
-            if month_t is not None:
-                month_t = month_t.to(device)
+            x = x.to(device); y = y.to(device).squeeze(-1)
+            coords = coords.to(device) if coords is not None else None
+            month_t = month_t.to(device) if month_t is not None else None
+            z = z.to(device).squeeze(-1) if z is not None else None
+
             opt.zero_grad(set_to_none=True)
             if scaler.is_enabled():
                 with amp_autocast():
-                    if use_location:
-                        yhat, _ = model(x, coords, month_t)
-                    else:
-                        yhat, _ = model(x, mask=None)
-                    loss = loss_fn(yhat, y)
+                    out = model(x, coords, month_t) if use_location else model(x)
+                    yhat, zhat, _ = _split_model_outputs(out)
+                    pred_loss = loss_fn(yhat, y)
+                    phys_loss = torch.tensor(0.0, device=device)
+                    if expect_z and (zhat is not None):
+                        zpred = zhat.squeeze(-1)
+                        phys_loss = loss_fn(zpred, z)
+                    loss = pred_loss + loss_weight_physical * phys_loss
                 scaler.scale(loss).backward()
-                if cfg['train']['grad_clip_norm'] is not None:
+                if cfg['train'].get('grad_clip_norm') is not None:
                     scaler.unscale_(opt)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip_norm'])
                 scaler.step(opt)
                 scaler.update()
             else:
-                if use_location:
-                    yhat, _ = model(x, coords, month_t)
-                else:
-                    yhat, _ = model(x, mask=None)
-                loss = loss_fn(yhat, y)
+                out = model(x, coords, month_t) if use_location else model(x)
+                yhat, zhat, _ = _split_model_outputs(out)
+                pred_loss = loss_fn(yhat, y)
+                phys_loss = torch.tensor(0.0, device=device)
+                if expect_z and (zhat is not None):
+                    zpred = zhat.squeeze(-1)
+                    phys_loss = loss_fn(zpred, z)
+                loss = pred_loss + loss_weight_physical * phys_loss
                 loss.backward()
-                if cfg['train']['grad_clip_norm'] is not None:
+                if cfg['train'].get('grad_clip_norm') is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip_norm'])
                 opt.step()
-            tr_losses.append(loss.item())
-            global_step += 1
+
+            tr_tot_losses.append(loss.item())
+            tr_pred_losses.append(pred_loss.item())
+            tr_phys_losses.append(float(phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss))
+
+            # TB step logs
             if writer and (i+1) % cfg['logging']['log_every_steps'] == 0:
-                writer.add_scalar('train/loss', loss.item(), global_step)
-            # optional step CSV log
-            if save_step_csv and step_csv_path and ((i+1) % step_every == 0):
+                writer.add_scalar('train/step_total_loss', loss.item(), i + (epoch-1)*len(train_loader))
+                writer.add_scalar('train/step_pred_loss',  pred_loss.item(), i + (epoch-1)*len(train_loader))
+                writer.add_scalar('train/step_phys_loss',  tr_phys_losses[-1], i + (epoch-1)*len(train_loader))
+
+            # Optional CSV per-step
+            if save_step_csv and ((i+1) % step_every == 0):
                 _append_csv_row(step_csv_path, {
-                    'global_step': int(global_step),
                     'epoch': int(epoch),
                     'step_in_epoch': int(i+1),
-                    'train_loss': float(loss.item()),
+                    'train_total': float(tr_tot_losses[-1]),
+                    'train_pred': float(tr_pred_losses[-1]),
+                    'train_phys': float(tr_phys_losses[-1]),
                     'lr': float(opt.param_groups[0]['lr']),
                 })
 
-        tr_loss = float(np.mean(tr_losses))
+        tr_total = float(np.mean(tr_tot_losses)) if tr_tot_losses else float('nan')
+        tr_pred  = float(np.mean(tr_pred_losses)) if tr_pred_losses else float('nan')
+        tr_phys  = float(np.mean(tr_phys_losses)) if tr_phys_losses else 0.0
+
         ep_sec = time.perf_counter() - ep_t0
         samples_per_sec = seen / ep_sec if ep_sec > 0 else float('nan')
-        log.info(f"Epoch {epoch:03d} | train_loss={tr_loss:.5f} | "
-                 f"lr={opt.param_groups[0]['lr']:.3e} | "
-                 f"samples={seen} | {samples_per_sec:.1f} samples/s | "
+        log.info(f"Epoch {epoch:03d} | train_total={tr_total:.5f} | pred={tr_pred:.5f} | phys={tr_phys:.5f} | "
+                 f"lr={opt.param_groups[0]['lr']:.3e} | samples={seen} | {samples_per_sec:.1f} samples/s | "
                  f"duration={ep_sec:.1f}s")
 
-        # validate (if we have a val split)
+        if writer:
+            writer.add_scalar('train/epoch_total_loss', tr_total, epoch)
+            writer.add_scalar('train/epoch_pred_loss',  tr_pred,  epoch)
+            writer.add_scalar('train/epoch_phys_loss',  tr_phys,  epoch)
+            writer.add_scalar('opt/lr', opt.param_groups[0]['lr'], epoch)
+
+        # --------------------------- validation ---------------------------- #
         if val_loader is not None:
-            val_loss, y_pred_val, y_true_val = evaluate(val_loader, model, device, loss_fn,
-                                                       use_location=use_location, return_month=return_month)
-            log.info(f"Epoch {epoch:03d} | val_loss={val_loss:.5f}")
+            val_total, val_pred, val_phys, y_pred_val, y_true_val = evaluate(
+                val_loader, model, device, nn.HuberLoss(),
+                use_location=use_location,
+                return_month=return_month,
+                return_z=(physical_out_dim > 0),
+                loss_weight_physical=loss_weight_physical
+            )
+            log.info(f"Epoch {epoch:03d} | val_total={val_total:.5f} | pred={val_pred:.5f} | phys={val_phys:.5f}")
+
             if save_epoch_csv:
                 _append_csv_row(epoch_csv_path, {
                     'timestamp': datetime.datetime.now().isoformat(timespec='seconds'),
                     'epoch': int(epoch),
-                    'train_loss': float(tr_loss),
-                    'val_loss': float(val_loss),
+                    'train_total': float(tr_total),
+                    'train_pred':  float(tr_pred),
+                    'train_phys':  float(tr_phys),
+                    'val_total':   float(val_total),
+                    'val_pred':    float(val_pred),
+                    'val_phys':    float(val_phys),
                     'lr': float(opt.param_groups[0]['lr']),
                     'epoch_seconds': float(ep_sec),
                     'samples_in_epoch': int(seen),
                     'samples_per_sec': float(samples_per_sec),
                 })
             if writer:
-                writer.add_scalar('train/epoch_loss', tr_loss, epoch)
-                writer.add_scalar('val/loss', val_loss, epoch)
-                if sched is not None:
-                    writer.add_scalar('opt/lr', opt.param_groups[0]['lr'], epoch)
-            if val_loss < best_val:
-                best_val = val_loss
+                writer.add_scalar('val/epoch_total_loss', val_total, epoch)
+                writer.add_scalar('val/epoch_pred_loss',  val_pred,  epoch)
+                writer.add_scalar('val/epoch_phys_loss',  val_phys,  epoch)
+
+            if val_total < best_val:
+                best_val = val_total
                 best_epoch = epoch
                 os.makedirs(cfg['project']['ckpt_dir'], exist_ok=True)
                 torch.save({'model': model.state_dict(), 'cfg': cfg, 'epoch': epoch},
                            os.path.join(run_ckpt_dir, 'best.pt'))
-            # after validation
+
+            # Scheduler step
             if sched is not None:
                 if isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                    sched.step(val_loss)  # needs the metric
+                    sched.step(val_total)
                 else:
-                    sched.step()  # e.g., ExponentialLR
-            if epoch - best_epoch >= patience:
+                    sched.step()
+
+            # Early stopping
+            if epoch - best_epoch >= int(cfg['train']['early_stopping']['patience']):
                 log.info(f"Early stopping at epoch {epoch} (best {best_epoch}, val {best_val:.4f})")
                 break
         else:
-            # no val loader; still save periodic checkpoints if desired
-            if save_epoch_csv and epoch_csv_path:
+            # No val loader; still step scheduler if non-plateau
+            if save_epoch_csv:
                 _append_csv_row(epoch_csv_path, {
                     'epoch': int(epoch),
-                    'train_loss': float(tr_loss),
-                    'val_loss': float('nan'),
+                    'train_total': float(tr_total),
+                    'train_pred':  float(tr_pred),
+                    'train_phys':  float(tr_phys),
+                    'val_total': float('nan'),
+                    'val_pred':  float('nan'),
+                    'val_phys':  float('nan'),
                     'lr': float(opt.param_groups[0]['lr']),
                 })
-            if sched is not None:
+            if sched is not None and not isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 sched.step()
 
-    # export VAL metrics if we had a val split
+    # ------------------------------ export --------------------------------- #
+
     if val_loader is not None and cfg['eval']['save_val_predictions']:
         out_csv = cfg['eval']['out_csv_val']
         mets_json = os.path.splitext(out_csv)[0] + '.metrics.json'
         ysc_path = os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib')
-        _val_loss, y_pred_val, y_true_val = evaluate(val_loader, model, device, loss_fn,
-                                                     use_location=use_location, return_month=return_month)
+        _vt, _vp, _vph, y_pred_val, y_true_val = evaluate(
+            val_loader, model, device, nn.HuberLoss(),
+            use_location=use_location, return_month=return_month,
+            return_z=(physical_out_dim > 0), loss_weight_physical=loss_weight_physical
+        )
         mets = save_predictions_and_metrics(y_true_val, y_pred_val, ysc_path, out_csv, mets_json)
-        print('Validation metrics:', json.dumps(mets, indent=2))
-        log.info("Validation metrics:\n%s", json.dumps(mets, indent=2))
+        logging.info("Validation metrics:\n%s", json.dumps(mets, indent=2))
 
-    # export TEST metrics if test split > 0
     if test_idx.size > 0:
         test_loader = DataLoader(Subset(ds, test_idx), batch_size=cfg['train']['batch_size'], shuffle=False,
-                                 num_workers=int(cfg['data']['num_workers']), pin_memory=True, drop_last=False)
-        _t_loss, y_pred_t, y_true_t = evaluate(test_loader, model, device, loss_fn,
-                                              use_location=use_location, return_month=return_month)
+                                 num_workers=int(cfg['data']['num_workers']), pin_memory=(device.type=='cuda'), drop_last=False)
+        _tt, _tp, _tph, y_pred_t, y_true_t = evaluate(
+            test_loader, model, device, nn.HuberLoss(),
+            use_location=use_location, return_month=return_month,
+            return_z=(physical_out_dim > 0), loss_weight_physical=loss_weight_physical
+        )
         out_csv_t = cfg['eval']['out_csv_test']
         mets_json_t = os.path.splitext(out_csv_t)[0] + '.metrics.json'
         ysc_path = os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib')
         tmets = save_predictions_and_metrics(y_true_t, y_pred_t, ysc_path, out_csv_t, mets_json_t)
-        print('Test metrics:', json.dumps(tmets, indent=2))
-        log.info("Test metrics:\n%s", json.dumps(tmets, indent=2))
+        logging.info("Test metrics:\n%s", json.dumps(tmets, indent=2))
 
     if writer:
         writer.close()
 
-    total_sec = time.perf_counter() - train_start
+    total_sec = time.perf_counter() - (train_start)
     log.info("Training finished in %.1fs (%.1f minutes)", total_sec, total_sec / 60.0)
+
+# --------------------------------- cli ------------------------------------ #
 
 if __name__ == '__main__':
     import argparse

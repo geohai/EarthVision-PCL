@@ -24,6 +24,8 @@ from .bilstm_attn import LuongAttention
 
 _LOG = logging.getLogger(__name__)
 
+__all__ = ["BiLSTMAttnLocRegressor", "LocationEncoderWrapper"]
+
 class LocationEncoderWrapper(nn.Module):
     """Wrapper around optional external location encoders.
 
@@ -68,16 +70,13 @@ class LocationEncoderWrapper(nn.Module):
                         self.encoder = Climplicit(config=cfg)
                     encoder_loaded = True
                 elif lname == 'geoclip':
-                    # GeoCLIP expects coordinates in [lat, lon] order.
-                    try:
-                        from rshf.geoclip import GeoCLIP  # type: ignore
-                    except Exception:
-                        from rshf.climplicit import GeoCLIP  # type: ignore
+                    # GeoCLIP expects coordinates in [lon, lat] order (two features).
+                    from rshf.geoclip import GeoCLIP, GeoCLIPConfig
                     model_name = "MVRL/geoclip-location-encoder"
                     if pretrained:
                         self.encoder = GeoCLIP.from_pretrained(model_name)
                     else:
-                        self.encoder = GeoCLIP()
+                        self.encoder = GeoCLIP(GeoCLIPConfig(sigma=[2, 2**2], input_size=2, encoded_size=256, dim=512))
                     encoder_loaded = True
                 elif lname == 'satclip':
                     # SatCLIP expects coordinates in [lon, lat] order.
@@ -172,11 +171,16 @@ class LocationEncoderWrapper(nn.Module):
 
 
 class BiLSTMAttnLocRegressor(nn.Module):
-    """Bi-LSTM regressor with attention and optional location fusion.
+    """Bi-LSTM regressor with attention, optional location fusion, and a physical head.
 
     This model extends the base BiLSTM regressor by fusing a location
     embedding with the LSTM's attention-derived context vector. Fusion is
     either via element-wise multiplication (Hadamard) or concatenation.
+    In addition to predicting a scalar observation target ``y`` from the
+    fused representation, the model can optionally predict one or more
+    physical simulation variables ``z`` directly from the location
+    embedding via a small MLP (``physical_head``). The number of outputs
+    for the physical head is specified at construction time.
     """
 
     def __init__(self,
@@ -196,20 +200,23 @@ class BiLSTMAttnLocRegressor(nn.Module):
                  loc_freeze: bool = True,
                  loc_proj_dim: Optional[int] = None,
                  fusion_method: str = 'concat',
-                 fusion_hidden_dim: int = 256):
+                 fusion_hidden_dim: int = 256,
+                 physical_head_hidden_dim: Optional[int] = None,
+                 physical_out_dim: int = 0) -> None:
         super().__init__()
-        # Sequence branch
+        # Sequence branch: BiLSTM producing temporal embeddings
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
                             batch_first=True,
-                            dropout=dropout if num_layers>1 else 0.0,
+                            dropout=dropout if num_layers > 1 else 0.0,
                             bidirectional=bidirectional)
         self.bidirectional = bidirectional
-        out_dim = hidden_size * (2 if bidirectional else 1)
-        self.norm = nn.LayerNorm(out_dim) if layer_norm else nn.Identity()
+        self.ts_ctx_dim = hidden_size * (2 if bidirectional else 1)
+        # Normalization for the LSTM outputs
+        self.norm = nn.LayerNorm(self.ts_ctx_dim) if layer_norm else nn.Identity()
         # Attention mechanism
-        self.attn = LuongAttention(out_dim, attn_dim if attn_type=='luong' else None)
+        self.attn = LuongAttention(self.ts_ctx_dim, attn_dim if attn_type == 'luong' else None)
         # Location encoder (optional)
-        self.loc_encoder = None
+        self.loc_encoder: Optional[LocationEncoderWrapper] = None
         if loc_name and str(loc_name).lower() not in ('none', ''):
             self.loc_encoder = LocationEncoderWrapper(
                 name=loc_name,
@@ -219,51 +226,59 @@ class BiLSTMAttnLocRegressor(nn.Module):
                 freeze=loc_freeze,
                 project_dim=loc_proj_dim
             )
-            loc_out_dim = self.loc_encoder.output_dim
+            loc_emb_out = self.loc_encoder.output_dim
         else:
-            loc_out_dim = 0
-        # 1) Temporal context dimension (BiLSTM output per time step)
-        self.ts_ctx_dim = hidden_size * (2 if bidirectional else 1)
-
-        # 2) Location embedding dimension after optional projection
-        loc_dim = loc_proj_dim if loc_proj_dim is not None else loc_emb_dim
-        # 3) Fused dimension
+            loc_emb_out = 0
+        # Determine location embedding dimensionality after projection (if projection is used)
+        loc_dim = loc_proj_dim if (loc_proj_dim is not None) else loc_emb_dim
+        # Determine the fused input dimension for the observation head
         fm = fusion_method.lower() if fusion_method else 'concat'
         if fm == 'concat':
             fused_in = self.ts_ctx_dim + loc_dim
         elif fm == 'hadamard':
             if loc_dim != self.ts_ctx_dim:
                 raise ValueError(
-                    f"Hadamard fusion requires equal dims: ts={self.ts_ctx_dim}, loc={loc_dim}. "
-                    "Set model.location.proj_dim to match ts_ctx_dim."
+                    f"Hadamard fusion requires equal dims: ts_ctx_dim={self.ts_ctx_dim}, loc_dim={loc_dim}. "
+                    "Set model.location.proj_dim equal to the LSTM context dimension."
                 )
             fused_in = self.ts_ctx_dim
         else:
-            raise ValueError(f"Unknown fusion method: {fusion}")
+            raise ValueError(f"Unknown fusion method: {fusion_method}")
         self.fusion_method = fm
-        # Regression head: map fused representation to a scalar via a hidden layer
+        # Observation regression head: maps fused representation to a scalar
         self.head = nn.Sequential(
             nn.Linear(fused_in, fusion_hidden_dim),
             nn.ReLU(),
             nn.Linear(fusion_hidden_dim, 1)
         )
+        # Physical simulation head: maps location embedding to one or more outputs
+        self.physical_head: Optional[nn.Module] = None
+        if physical_out_dim and physical_head_hidden_dim is not None and physical_out_dim > 0:
+            self.physical_head = nn.Sequential(
+                nn.Linear(loc_dim, physical_head_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(physical_head_hidden_dim, physical_out_dim)
+            )
+        self.physical_out_dim = physical_out_dim
 
     def forward(self,
                 x: torch.Tensor,
                 coords: Optional[torch.Tensor] = None,
                 month: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """Forward pass through the model.
 
         Args:
-            x: Tensor of shape [B,T,F] containing the time-series input.
-            coords: Optional tensor of shape [B,2] with (lat, lon) per sample.
-            month: Optional tensor of shape [B] or [B,1] with month indices (1-12).
+            x: Tensor of shape [B, T, F] containing the time-series input.
+            coords: Optional tensor of shape [B, 2] with (lat, lon) per sample.
+            month: Optional tensor of shape [B] or [B, 1] with month indices (1-12).
             mask: Optional tensor indicating valid positions in ``x`` (unused in current implementation).
 
         Returns:
-            tuple: (y_hat, attn) where ``y_hat`` is the predicted scalar for each
-            sample and ``attn`` are the attention weights over the time dimension.
+            A tuple ``(y_hat, z_hat, attn)`` where ``y_hat`` is the predicted scalar for each
+            sample, ``z_hat`` is the predicted physical simulation vector (or ``None`` if the
+            physical head is disabled), and ``attn`` contains the attention weights over the
+            time dimension.
         """
         # Sequence branch
         out, (h, _) = self.lstm(x)
@@ -273,19 +288,24 @@ class BiLSTMAttnLocRegressor(nn.Module):
             q = torch.cat([h[-2], h[-1]], dim=-1)
         else:
             q = h[-1]
+        # Compute attention-based context vector
         ctx, attn = self.attn(out, q, mask)
         # Optionally compute location embedding
-        loc_emb = None
+        loc_emb: Optional[torch.Tensor] = None
         if self.loc_encoder is not None:
             if coords is None:
                 raise ValueError("coords must be provided when using a location encoder")
             loc_emb = self.loc_encoder(coords, month)
-        # Fuse context and location
+        # Fuse context and location for the observation head
         if self.fusion_method == 'hadamard' and loc_emb is not None:
             fused = ctx * loc_emb
         elif loc_emb is not None:
             fused = torch.cat([ctx, loc_emb], dim=-1)
         else:
             fused = ctx
-        y = self.head(fused).squeeze(-1)
-        return y, attn
+        y_hat = self.head(fused).squeeze(-1)
+        # Predict physical variables if enabled
+        z_hat: Optional[torch.Tensor] = None
+        if self.physical_head is not None and loc_emb is not None:
+            z_hat = self.physical_head(loc_emb)
+        return y_hat, z_hat, attn

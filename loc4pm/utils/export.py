@@ -11,7 +11,7 @@ def save_predictions_and_metrics(y_true, y_pred, y_scaler_joblib_path: str, out_
     inv_true = np.array([ys.inverse_y(v) for v in y_true.reshape(-1)])
     inv_pred = np.array([ys.inverse_y(v) for v in y_pred.reshape(-1)])
 
-    df = pd.DataFrame({ 'truth': inv_true, 'pred': inv_pred })
+    df = pd.DataFrame({'truth': inv_true, 'pred': inv_pred})
     df.to_csv(out_csv, index=False)
 
     mets = regression_metrics(inv_true, inv_pred)

@@ -19,11 +19,13 @@ data:
   scaler_type: minmax
   scaler_range: [-1.0, 1.0]
   save_scalers_to: experiments/ckpt/scalers
-  num_workers: 4
+  num_workers: 10
   prefetch_files: 4
   # indices (in *raw* feature order) for lat/lon — used only to build spatial folds
   lat_feature_index: 5
   lon_feature_index: 6
+  z_feature_indices: [20]
+  z_scaler_range: [-1.0, 1.0]
 
 model:
   type: bilstm_attn
@@ -46,11 +48,12 @@ model:
     name: geoclip            # climplicit | geoclip | satclip | none
     variant: monthly      # monthly | annual (only for climplicit)
     emb_dim: 512          # raw embedding dimension of the location encoder
-    pretrained: true       # whether to load pretrained weights if available
-    freeze: true           # whether to freeze the location encoder during training
+    pretrained: false       # whether to load pretrained weights if available
+    freeze: false           # whether to freeze the location encoder during training
     proj_dim: null         # optional projection dimension; null for no projection
     fusion: concat        # concat | hadamard
-    head_hidden_dim: 256   # hidden dimension for the fusion regression head
+    head_hidden_dim: 512   # hidden dimension for the fusion regression head
+  physical_head_hidden_dim: 128
 
 # NEW: explicit split section
 split:
@@ -70,8 +73,8 @@ train:
   grad_clip_norm: 1.0
   optimizer: { name: adam, lr: 3.0e-4, weight_decay: 1.0e-5 }
   scheduler:
-    name: exponential
-    gamma: 0.98
+    name: exponential # exponential | reduce_on_plateau
+    gamma: 0.96
 #    mode: min
 #    factor: 0.5
 #    patience: 5
@@ -80,6 +83,7 @@ train:
 #    cooldown: 2
 #    min_lr: 1.0e-6
   early_stopping: { patience: 30 }
+  loss_weight_physical: 0.1
 
 logging:
   tensorboard: true
