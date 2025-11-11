@@ -71,17 +71,17 @@ train:
   epochs: 100
   batch_size: 256
   grad_clip_norm: 1.0
-  optimizer: { name: adam, lr: 3.0e-4, weight_decay: 1.0e-5 }
+  optimizer: { name: adam, lr: 3.0e-4, weight_decay: 0.0 }
   scheduler:
-    name: exponential # exponential | reduce_on_plateau
-    gamma: 0.96
-#    mode: min
-#    factor: 0.5
-#    patience: 5
-#    threshold: 1.0e-6
-#    threshold_mode: rel      # or 'rel' if you prefer relative tolerance
-#    cooldown: 2
-#    min_lr: 1.0e-6
+    name: reduce_on_plateau # exponential | reduce_on_plateau
+#    gamma: 0.96
+    mode: min
+    factor: 0.5
+    patience: 5
+    threshold: 1.0e-6
+    threshold_mode: rel      # or 'rel' if you prefer relative tolerance
+    cooldown: 2
+    min_lr: 1.0e-6
   early_stopping: { patience: 30 }
   loss_weight_physical: 0.1
 

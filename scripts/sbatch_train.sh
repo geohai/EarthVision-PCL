@@ -21,7 +21,7 @@ cd /ocean/projects/cis250170p/zwang63/src/loc4pm
 export PYTHONPATH=$(pwd):${PYTHONPATH:-}
 
 # 1) Stage data to node-local scratch
-SRC=/ocean/projects/cis250170p/zwang63/data/loc4pm/processed/EO_NCAR_merged
+SRC=/ocean/projects/cis250170p/zwang63/data/loc4pm/processed/EO_NCAR_merged_maxslope
 DST=${SLURM_TMPDIR:-/tmp/$USER/$SLURM_JOB_ID}/data
 mkdir -p "$DST"
 rsync -a --info=progress2 "$SRC"/ "$DST"/

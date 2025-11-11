@@ -113,7 +113,7 @@ class LocationEncoderWrapper(nn.Module):
                 p.requires_grad = False
         # Optional projection layer: if provided, this maps the raw encoder output
         # to a user-specified dimension (useful when performing Hadamard fusion).
-        if project_dim is not None and project_dim > 0 and project_dim != emb_dim:
+        if project_dim is not None and project_dim > 0:
             self.proj = nn.Linear(emb_dim, project_dim, bias=False)
             self.output_dim = project_dim
         else:
