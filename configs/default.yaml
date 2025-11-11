@@ -45,8 +45,8 @@ model:
   # ``proj_dim`` is provided and differs from ``emb_dim``, the location
   # embeddings will be projected to this dimensionality prior to fusion.
   location:
-    name: geoclip            # climplicit | geoclip | satclip | none
-    variant: monthly      # monthly | annual (only for climplicit)
+    name: resiren            # climplicit | geoclip | satclip | siren | resiren |none
+    variant: annual      # monthly | annual (only for climplicit)
     emb_dim: 512          # raw embedding dimension of the location encoder
     pretrained: false       # whether to load pretrained weights if available
     freeze: false           # whether to freeze the location encoder during training
