@@ -262,3 +262,106 @@ class DailyTSDataset(Dataset):
             out.append(z_row.astype(np.float32))
         out.append(y_row)
         return tuple(out)
+
+# ---------------------------------------------------------------------------
+# NCAR grid loading and random sampling
+#
+# The following functions provide a lightweight interface for loading NCAR
+# reanalysis parquet files and sampling random latitude/longitude points
+# uniformly within each grid cell.  They are intended to be used in
+# ``train.py`` when augmenting training batches with synthetic samples.
+
+_NCAR_CACHE: Dict[str, np.ndarray] = {}
+
+
+def load_ncar_grid(ncar_path: str) -> None:
+    """Load NCAR parquet files and cache arrays for random sampling.
+
+    This function reads all ``*.parquet`` files under ``ncar_path`` and
+    extracts the minimum and maximum latitudes and longitudes for each
+    grid cell, the PM25_TOT target and the month index derived from the
+    ``date`` column.  The resulting arrays are stored in a module‑level
+    cache so that subsequent calls to ``sample_ncar_points`` can reuse
+    them without reloading the parquet files.
+
+    Parameters
+    ----------
+    ncar_path: str
+        Directory containing parquet files, one per month, with columns
+        ``['lat_nw','lon_nw','lat_ne','lon_ne','lat_se','lon_se','lat_sw','lon_sw','PM25_TOT','date']``.
+    """
+    if 'lat_min' in _NCAR_CACHE:
+        return  # already loaded
+    files = sorted([os.path.join(ncar_path, f) for f in os.listdir(ncar_path) if f.endswith('.parquet')])
+    dfs: List[pd.DataFrame] = []
+    required = {
+        'lat_nw', 'lon_nw', 'lat_ne', 'lon_ne', 'lat_se', 'lon_se',
+        'lat_sw', 'lon_sw', 'PM25_TOT', 'date'
+    }
+    for f in files:
+        try:
+            df = pd.read_parquet(f)
+        except Exception:
+            continue
+        if df.empty or not required.issubset(df.columns):
+            continue
+        dfs.append(df[list(required)])
+    if not dfs:
+        return
+    df_all = pd.concat(dfs, ignore_index=True)
+    corners_lat = df_all[['lat_nw', 'lat_ne', 'lat_se', 'lat_sw']].to_numpy(dtype=float)
+    corners_lon = df_all[['lon_nw', 'lon_ne', 'lon_se', 'lon_sw']].to_numpy(dtype=float)
+    _NCAR_CACHE['lat_min'] = corners_lat.min(axis=1)
+    _NCAR_CACHE['lat_max'] = corners_lat.max(axis=1)
+    _NCAR_CACHE['lon_min'] = corners_lon.min(axis=1)
+    _NCAR_CACHE['lon_max'] = corners_lon.max(axis=1)
+    _NCAR_CACHE['z'] = df_all['PM25_TOT'].to_numpy(dtype=float)
+    try:
+        months = pd.to_datetime(df_all['date']).dt.month.to_numpy(dtype=int)
+    except Exception:
+        months = np.ones(len(df_all), dtype=int)
+    _NCAR_CACHE['month'] = months
+
+
+def sample_ncar_points(num_samples: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Sample random NCAR points uniformly within grid cells.
+
+    Parameters
+    ----------
+    num_samples: int
+        Number of random points to sample.  If zero or the NCAR cache is
+        empty, returns empty arrays.
+
+    Returns
+    -------
+    coords : ndarray of shape [N,2]
+        Sampled latitude/longitude coordinates (lat, lon).
+    months : ndarray of shape [N]
+        Month indices (1‑12) corresponding to the sampled points.
+    z_vals : ndarray of shape [N]
+        Physical target values (PM25_TOT) for the sampled points.
+    """
+    if num_samples <= 0 or 'lat_min' not in _NCAR_CACHE:
+        return (
+            np.zeros((0, 2), dtype=float),
+            np.zeros((0,), dtype=int),
+            np.zeros((0,), dtype=float),
+        )
+    lat_min = _NCAR_CACHE['lat_min']
+    lat_max = _NCAR_CACHE['lat_max']
+    lon_min = _NCAR_CACHE['lon_min']
+    lon_max = _NCAR_CACHE['lon_max']
+    z_vals_full = _NCAR_CACHE['z']
+    months_full = _NCAR_CACHE['month']
+    # Randomly select rows
+    idxs = np.random.randint(0, len(lat_min), size=int(num_samples))
+    lat_low = lat_min[idxs]
+    lat_hi = lat_max[idxs]
+    lon_low = lon_min[idxs]
+    lon_hi = lon_max[idxs]
+    lats = lat_low + np.random.rand(int(num_samples)) * (lat_hi - lat_low)
+    lons = lon_low + np.random.rand(int(num_samples)) * (lon_hi - lon_low)
+    coords = np.stack([lats, lons], axis=1)
+    months = months_full[idxs]
+    z_vals = z_vals_full[idxs]
+    return coords.astype(float), months.astype(int), z_vals.astype(float)
