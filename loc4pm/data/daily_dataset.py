@@ -81,6 +81,82 @@ class MinMaxScalerLite:
         y = (z - self.lo) / (self.hi - self.lo) * den + self.min
         return y
 
+# ---------------------------------------------------------------------------
+# Additional scaler: RobustScalerLite
+#
+# This scaler uses the median and inter‑quartile range (IQR) to perform
+# robust scaling on targets.  It is particularly useful for variables like
+# PM2.5 concentrations that exhibit strong right‑skew and outliers.  Values
+# are centred around the median and scaled by the IQR, then mapped into a
+# specified range.  See ``RobustScalerLite.transform_y`` for details.
+# ---------------------------------------------------------------------------
+class RobustScalerLite:
+    """A robust scaler using the median and IQR.
+
+    This scaler scales targets based on their median and inter‑quartile range (IQR), which makes it more
+    robust to outliers and right‑skewed distributions compared to a simple min/max scaler.  The scaled
+    values are linearly mapped into a specified range.  For example, with ``feature_range=(-1, 1)``,
+    the first quartile (25th percentile) of the data will map to approximately ``-0.5`` and the third
+    quartile (75th percentile) will map to ``0.5``.
+
+    Parameters
+    ----------
+    feature_range: tuple of (low, high)
+        Desired range of transformed data.  Defaults to (-1.0, 1.0).
+    """
+    def __init__(self, feature_range: Tuple[float, float] = (-1.0, 1.0)) -> None:
+        self.median: Optional[float] = None
+        self.iqr: Optional[float] = None
+        self.lo, self.hi = feature_range
+
+    def fit_y_chunk(self, y: np.ndarray) -> None:
+        """Update the scaler's median and IQR using a chunk of target values.
+
+        Args
+        ----
+        y: Array of shape [N] or [N,1] containing target values.
+        """
+        # flatten and convert to float
+        y_flat = y.reshape(-1).astype(float)
+        med = float(np.nanmedian(y_flat))
+        q1 = float(np.nanpercentile(y_flat, 25))
+        q3 = float(np.nanpercentile(y_flat, 75))
+        iqr = q3 - q1
+        # avoid zero IQR
+        if iqr == 0:
+            iqr = 1.0
+        if self.median is None:
+            self.median = med
+            self.iqr = iqr
+        else:
+            # simple running average to accumulate across chunks
+            self.median = (self.median + med) / 2.0
+            self.iqr = (self.iqr + iqr) / 2.0
+
+    def transform_y(self, y: np.ndarray) -> np.ndarray:
+        """Scale target values using the robust statistics.
+
+        Values are first centered around the median and scaled by the IQR, then mapped into the
+        specified ``feature_range``.  Note that the lower and upper quartiles map to around
+        ``0.25*(hi - lo) + lo`` and ``0.75*(hi - lo) + lo``, respectively.
+        """
+        if self.median is None or self.iqr is None:
+            raise RuntimeError("RobustScalerLite must be fitted before calling transform_y")
+        # center and scale by IQR: q1→-0.5, q3→0.5
+        z = (y - self.median) / self.iqr
+        # map from [-0.5, 0.5] to [lo, hi]
+        return z * (self.hi - self.lo) + (self.hi + self.lo) / 2.0
+
+    def inverse_y(self, z: np.ndarray) -> np.ndarray:
+        if self.median is None or self.iqr is None:
+            raise RuntimeError("RobustScalerLite must be fitted before calling inverse_y")
+        # map back to centred and scaled values
+        z0 = (z - (self.hi + self.lo) / 2.0) / (self.hi - self.lo)
+        return z0 * self.iqr + self.median
+
+
+# New robust scaler will be appended later via patch
+
 
 def iter_dates(start_date: str, end_date: str) -> List[str]:
     d0 = pd.to_datetime(start_date)
@@ -119,6 +195,7 @@ class DailyTSDataset(Dataset):
                  filter_y_positive: bool = True,
                  remove_nan_rows: bool = True,
                  scaler_range: Tuple[float, float] = (-1.0, 1.0),
+                 scaler_type: str = 'minmax',
                  prefetch_files: int = 4,
                  lat_feature_index: Optional[int] = None,
                  lon_feature_index: Optional[int] = None,
@@ -126,7 +203,8 @@ class DailyTSDataset(Dataset):
                  return_coords: bool = False,
                  return_month: bool = False,
                  z_feature_indices: Optional[List[int]] = None,
-                 z_scaler_range: Optional[Tuple[float, float]] = None) -> None:
+                 z_scaler_range: Optional[Tuple[float, float]] = None,
+                 ncar_path: Optional[str] = None) -> None:
         super().__init__()
         self.root = root
         self.dates = iter_dates(start_date, end_date)
@@ -147,10 +225,31 @@ class DailyTSDataset(Dataset):
         self.keep_feat_idx: Optional[List[int]] = None
         self.file_meta: List[Dict] = []
         x_scaler = MinMaxScalerLite(feature_range=scaler_range)
-        y_scaler = MinMaxScalerLite(feature_range=scaler_range)
+        # Choose target scaler based on requested type; robust scaling can better handle right-skewed PM2.5
+        scaler_type_lower = (scaler_type or 'minmax').lower()
+        if scaler_type_lower == 'robust':
+            y_scaler = RobustScalerLite(feature_range=scaler_range)
+        else:
+            y_scaler = MinMaxScalerLite(feature_range=scaler_range)
         # Use separate scaler for z if provided; fallback to same range
         z_range = z_scaler_range if z_scaler_range is not None else scaler_range
         z_scaler = MinMaxScalerLite(feature_range=z_range) if self.return_z else None
+
+        # Optionally pre-fit the z scaler on the full NCAR PM25_TOT distribution.
+        # This uses all values from the parquet files (via ``load_ncar_grid``)
+        # instead of only the EO rows present in this dataset.
+        self._z_prefit_on_ncar = False
+        if self.return_z and z_scaler is not None and ncar_path:
+            try:
+                # load_ncar_grid and _NCAR_CACHE are defined later in this module
+                load_ncar_grid(ncar_path)
+                if 'z' in _NCAR_CACHE:
+                    # _NCAR_CACHE['z'] is df_all['PM25_TOT'].to_numpy(...)
+                    z_scaler.fit_y_chunk(_NCAR_CACHE['z'])
+                    self._z_prefit_on_ncar = True
+            except Exception:
+                # If anything goes wrong, we fall back to fitting on EO samples below.
+                self._z_prefit_on_ncar = False
 
         index_map: List[Tuple[int, int]] = []
         coords_list: List[Tuple[float, float]] = []
@@ -184,12 +283,12 @@ class DailyTSDataset(Dataset):
             if valid_idx.size:
                 x_scaler.fit_x_chunk(Xk[valid_idx])
                 y_scaler.fit_y_chunk(y[valid_idx])
-                # Fit z scaler on valid rows if needed
-                if self.return_z and z_scaler is not None:
+                # Fit z scaler on valid rows only if we did NOT already pre-fit on NCAR.
+                if self.return_z and z_scaler is not None and not self._z_prefit_on_ncar:
                     # Extract z_chunk from raw X for all time steps to capture variability, shape [N,T,len(z)]
-                    z_chunk = X[valid_idx][:, -1, self.z_feature_indices]
+                    z_chunk = X[valid_idx][:, :, self.z_feature_indices]
                     # For scaling, treat z as features with a dummy time dimension
-                    z_scaler.fit_x_chunk(z_chunk[:, None, :])
+                    z_scaler.fit_x_chunk(z_chunk)
             # Populate index map and auxiliary metadata
             for rid in valid_idx:
                 index_map.append((fid, int(rid)))

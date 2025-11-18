@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from typing import Optional
 
 class LuongAttention(nn.Module):
     def __init__(self, hidden_dim, attn_dim=None):
@@ -21,7 +22,8 @@ class LuongAttention(nn.Module):
 
 class BiLSTMAttnRegressor(nn.Module):
     def __init__(self, input_size, hidden_size=256, num_layers=3, bidirectional=True,
-                 dropout=0.2, layer_norm=True, attn_type='luong', attn_dim=256):
+                 dropout=0.2, layer_norm=True, attn_type='luong', attn_dim=256,
+                 head_dropout: Optional[float] = None):
         super().__init__()
         self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
                             batch_first=True,
@@ -30,7 +32,11 @@ class BiLSTMAttnRegressor(nn.Module):
         out_dim = hidden_size * (2 if bidirectional else 1)
         self.norm = nn.LayerNorm(out_dim) if layer_norm else nn.Identity()
         self.attn = LuongAttention(out_dim, attn_dim if attn_type=='luong' else None)
-        self.head = nn.Sequential(nn.Dropout(dropout), nn.Linear(out_dim, 1))
+        # Choose a separate dropout rate for the prediction head if provided.  If not, reuse the
+        # sequence dropout to preserve backward compatibility.  A modest dropout (e.g. 0.1–0.2)
+        # can improve generalization for the final regression layer.
+        hd = dropout if head_dropout is None else float(head_dropout)
+        self.head = nn.Sequential(nn.Dropout(hd), nn.Linear(out_dim, 1))
 
     def forward(self, x, mask=None):
         out, (h, _) = self.lstm(x)       # out: [B,T,H*dir]

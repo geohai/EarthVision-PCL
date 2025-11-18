@@ -239,11 +239,12 @@ class BiLSTMAttnLocRegressor(nn.Module):
         loc_pretrained: bool = True,
         loc_freeze: bool = True,
         loc_proj_dim: Optional[int] = None,
-        fusion_method: str = 'concat',
-        fusion_hidden_dim: int = 256,
-        physical_head_hidden_dim: Optional[int] = None,
-        physical_out_dim: int = 0,
-    ) -> None:
+         fusion_method: str = 'concat',
+         fusion_hidden_dim: int = 256,
+         physical_head_hidden_dim: Optional[int] = None,
+         physical_out_dim: int = 0,
+         head_dropout: Optional[float] = None,
+     ) -> None:
         super().__init__()
         # Sequence branch: BiLSTM producing temporal embeddings
         self.lstm = nn.LSTM(
@@ -291,9 +292,15 @@ class BiLSTMAttnLocRegressor(nn.Module):
             raise ValueError(f"Unknown fusion method: {fusion_method}")
         self.fusion_method = fm
         # Observation regression head: maps fused representation to a scalar
+        # Allow optional dropout on the hidden and/or output layer to improve generalization.  If
+        # ``head_dropout`` is ``None``, fall back to no dropout to preserve prior behavior.  We
+        # insert the dropout after the first activation so that it stochastically zeros hidden
+        # activations before the final linear layer.
+        hd = float(dropout) if head_dropout is None else float(head_dropout)
         self.head = nn.Sequential(
             nn.Linear(fused_in, fusion_hidden_dim),
             nn.ReLU(),
+            nn.Dropout(hd),
             nn.Linear(fusion_hidden_dim, 1),
         )
         # Physical simulation head: maps location embedding to one or more outputs

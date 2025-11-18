@@ -255,6 +255,7 @@ def make_dataset(cfg):
     # Optional z targets
     z_feature_indices = data_cfg.get('z_feature_indices', [])
     z_scaler_range = tuple(data_cfg.get('z_scaler_range', data_cfg.get('scaler_range', (-1.0, 1.0))))
+    ncar_path = data_cfg.get('ncar_grid_path', None)
 
     ds = DailyTSDataset(
         root=data_cfg['root'],
@@ -274,6 +275,9 @@ def make_dataset(cfg):
         # NEW for physical head
         z_feature_indices=z_feature_indices,
         z_scaler_range=z_scaler_range,
+        # NEW: allow choosing target scaler type (minmax or robust)
+        scaler_type=data_cfg.get('scaler_type', 'minmax'),
+        ncar_path=ncar_path,
     )
 
     os.makedirs(data_cfg['save_scalers_to'], exist_ok=True)
@@ -551,6 +555,7 @@ def run(cfg_path: str, overrides=None):
     data_cfg = cfg.get('data', {})
     z_feature_indices = data_cfg.get('z_feature_indices', [])
     physical_out_dim = len(z_feature_indices)
+    # Base weight for physical loss (may be dynamically updated)
     loss_weight_physical = float(cfg['train'].get('loss_weight_physical', 0.0))
 
     # Location / model config
@@ -561,7 +566,8 @@ def run(cfg_path: str, overrides=None):
     return_month = use_location and loc_variant == 'monthly'
     physical_head_hidden_dim = cfg['model'].get('physical_head_hidden_dim', cfg['model']['attention']['attn_dim'])
 
-    # Build model
+    # Build model with optional head dropout
+    head_dropout = cfg['model'].get('head_dropout', None)
     if use_location:
         model = BiLSTMAttnLocRegressor(
             input_size=input_size,
@@ -583,6 +589,7 @@ def run(cfg_path: str, overrides=None):
             # NEW: physical head
             physical_head_hidden_dim=physical_head_hidden_dim if physical_out_dim > 0 else None,
             physical_out_dim=physical_out_dim,
+            head_dropout=head_dropout,
         ).to(device)
     else:
         model = BiLSTMAttnRegressor(
@@ -594,6 +601,7 @@ def run(cfg_path: str, overrides=None):
             layer_norm=cfg['model']['layer_norm'],
             attn_type=cfg['model']['attention']['type'],
             attn_dim=cfg['model']['attention']['attn_dim'],
+            head_dropout=head_dropout,
         ).to(device)
 
     # --- Setup banner ---
@@ -640,17 +648,29 @@ def run(cfg_path: str, overrides=None):
         log.info("  [%s] trainable=%s / total=%s", k, f"{v['trainable']:,}", f"{v['total']:,}")
 
     # Optimizer / scheduler / loss
-    opt = torch.optim.Adam(
-        model.parameters(),
-        lr=cfg['train']['optimizer']['lr'],
-        weight_decay=cfg['train']['optimizer']['weight_decay'],
-    )
+    opt_cfg = cfg['train'].get('optimizer', {})
+    opt_name = str(opt_cfg.get('name', 'adam')).lower()
+    lr = float(opt_cfg.get('lr', 1e-3))
+    default_wd = float(opt_cfg.get('weight_decay', 0.0))
+    branch_wd = opt_cfg.get('branch_weight_decay', {}) or {}
+    # Build parameter groups with branch‑specific weight decay
+    param_groups = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        top = name.split('.')[0]
+        wd = branch_wd.get(top, default_wd)
+        param_groups.append({'params': [param], 'weight_decay': wd})
+    if opt_name == 'adamw':
+        opt = torch.optim.AdamW(param_groups, lr=lr, weight_decay=0.0)
+    else:
+        # fall back to Adam; use zero global weight decay since per‑group values are set
+        opt = torch.optim.Adam(param_groups, lr=lr, weight_decay=0.0)
     sched = make_scheduler(opt, cfg)
     scfg = cfg['train'].get('scheduler', {})
     log.info(
-        "Optimizer: Adam(lr=%.3e, weight_decay=%.1e)",
-        cfg['train']['optimizer']['lr'],
-        cfg['train']['optimizer']['weight_decay'],
+        "Optimizer: %s(lr=%.3e, default_weight_decay=%.1e) with branch overrides: %s",
+        opt_name.upper(), lr, default_wd, branch_wd,
     )
     log.info(
         "Scheduler: %s %s",
@@ -714,6 +734,16 @@ def run(cfg_path: str, overrides=None):
         except Exception as e:
             log.warning("Failed to load NCAR grid from %s: %s", ncar_path, e)
             ncar_ratio = 0.0
+
+    # --------------------- dynamic weight update setup -------------------- #
+    dwa_cfg = cfg['train'].get('loss_weight_physical_dynamic', {}) or {}
+    dwa_enabled = bool(dwa_cfg.get('enabled', False))
+    dwa_temp = float(dwa_cfg.get('temperature', 2.0)) if dwa_enabled else None
+    dwa_cap = dwa_cfg.get('cap', None)
+    prev_pred_loss_epoch = None
+    prev_prev_pred_loss_epoch = None
+    prev_phys_loss_epoch = None
+    prev_prev_phys_loss_epoch = None
 
     # ----------------------------- training -------------------------------- #
     train_start = time.perf_counter()
@@ -853,6 +883,7 @@ def run(cfg_path: str, overrides=None):
                     },
                 )
 
+        # Compute epoch-level statistics
         tr_total = float(np.mean(tr_tot_losses)) if tr_tot_losses else float('nan')
         tr_pred = float(np.mean(tr_pred_losses)) if tr_pred_losses else float('nan')
         tr_phys = float(np.mean(tr_phys_losses)) if tr_phys_losses else 0.0
@@ -871,6 +902,33 @@ def run(cfg_path: str, overrides=None):
             writer.add_scalar('train/epoch_pred_loss', tr_pred, epoch)
             writer.add_scalar('train/epoch_phys_loss', tr_phys, epoch)
             writer.add_scalar('opt/lr', opt.param_groups[0]['lr'], epoch)
+
+        # ---------- dynamic loss weight update ----------
+        if dwa_enabled:
+            if prev_pred_loss_epoch is not None and prev_prev_pred_loss_epoch is not None and prev_phys_loss_epoch is not None and prev_prev_phys_loss_epoch is not None:
+                ratio_pred = prev_pred_loss_epoch / max(prev_prev_pred_loss_epoch, 1e-8)
+                ratio_phys = prev_phys_loss_epoch / max(prev_prev_phys_loss_epoch, 1e-8)
+                # Compute weighting ratio using softmax across two tasks
+                exp_pred = np.exp(ratio_pred / dwa_temp)
+                exp_phys = np.exp(ratio_phys / dwa_temp)
+                # weight for physical relative to prediction
+                weight_ratio = exp_phys / exp_pred
+                # Update the loss weight multiplicatively
+                loss_weight_physical = loss_weight_physical * weight_ratio
+                # Optionally cap the weight to prevent explosion
+                if dwa_cap is not None:
+                    loss_weight_physical = float(min(loss_weight_physical, dwa_cap))
+                log.info(
+                    "Dynamic weight update: ratio_pred=%.4f, ratio_phys=%.4f, weight_ratio=%.4f, new_loss_weight_physical=%.5f",
+                    ratio_pred, ratio_phys, weight_ratio, loss_weight_physical,
+                )
+                if writer:
+                    writer.add_scalar('train/loss_weight_physical', loss_weight_physical, epoch)
+            # update historical losses for next epoch
+            prev_prev_pred_loss_epoch = prev_pred_loss_epoch
+            prev_pred_loss_epoch = tr_pred
+            prev_prev_phys_loss_epoch = prev_phys_loss_epoch
+            prev_phys_loss_epoch = tr_phys
 
         # --------------------------- validation ---------------------------- #
         if val_loader is not None:
@@ -902,6 +960,7 @@ def run(cfg_path: str, overrides=None):
                         'epoch_seconds': float(ep_sec),
                         'samples_in_epoch': int(seen),
                         'samples_per_sec': float(samples_per_sec),
+                        'loss_weight_physical': float(loss_weight_physical),
                     },
                 )
             if writer:
@@ -940,6 +999,7 @@ def run(cfg_path: str, overrides=None):
                         'val_pred': float('nan'),
                         'val_phys': float('nan'),
                         'lr': float(opt.param_groups[0]['lr']),
+                        'loss_weight_physical': float(loss_weight_physical),
                     },
                 )
             if sched is not None and not isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
