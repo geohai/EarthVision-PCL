@@ -249,7 +249,8 @@ def make_dataset(cfg):
     loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
     return_coords = bool(loc_name and loc_name not in ('none', ''))
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
-    return_month = return_coords and loc_variant == 'monthly'
+    # Return time index (month or day of year) whenever a variant is specified
+    return_month = return_coords and loc_variant in ('monthly', 'doy')
 
     data_cfg = cfg['data']
     # Optional z targets
@@ -278,6 +279,8 @@ def make_dataset(cfg):
         # NEW: allow choosing target scaler type (minmax or robust)
         scaler_type=data_cfg.get('scaler_type', 'minmax'),
         ncar_path=ncar_path,
+        # NEW: propagate variant to dataset for temporal encoding
+        time_variant=loc_variant,
     )
 
     os.makedirs(data_cfg['save_scalers_to'], exist_ok=True)
@@ -563,7 +566,8 @@ def run(cfg_path: str, overrides=None):
     loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
     use_location = bool(loc_name and loc_name not in ('none', ''))
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
-    return_month = use_location and loc_variant == 'monthly'
+    # Return month/day-of-year when location is used and variant is specified
+    return_month = use_location and loc_variant in ('monthly', 'doy')
     physical_head_hidden_dim = cfg['model'].get('physical_head_hidden_dim', cfg['model']['attention']['attn_dim'])
 
     # Build model with optional head dropout

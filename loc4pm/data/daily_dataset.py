@@ -1,9 +1,9 @@
 """Daily time-series dataset with optional geographic and physical targets.
 
 This dataset loads daily time-series samples from NumPy files, applies
-feature scaling, and supports returning geographic coordinates, month
-indices, and additional physical simulation variables. It is an
-enhancement of the original ``DailyTSDataset`` to support dual targets
+feature scaling, and supports returning geographic coordinates, temporal indices
+such as month or day-of-year, and additional physical simulation variables. It
+is an enhancement of the original ``DailyTSDataset`` to support dual targets
 (observation and physical simulation) used in the dual-decoder model.
 """
 
@@ -15,7 +15,6 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from torch.utils.data import Dataset
-
 
 DATE_FMT = "%Y-%m-%d"
 
@@ -81,6 +80,7 @@ class MinMaxScalerLite:
         y = (z - self.lo) / (self.hi - self.lo) * den + self.min
         return y
 
+
 # ---------------------------------------------------------------------------
 # Additional scaler: RobustScalerLite
 #
@@ -90,6 +90,7 @@ class MinMaxScalerLite:
 # are centred around the median and scaled by the IQR, then mapped into a
 # specified range.  See ``RobustScalerLite.transform_y`` for details.
 # ---------------------------------------------------------------------------
+
 class RobustScalerLite:
     """A robust scaler using the median and IQR.
 
@@ -182,7 +183,7 @@ class DailyTSDataset(Dataset):
 
     This dataset loads daily samples of time-series features and observation
     targets from NumPy files. Optionally, it can return geographic
-    coordinates, month indices, and additional physical simulation targets.
+    coordinates, temporal indices (month or day-of-year), and additional physical simulation targets.
     """
 
     def __init__(self,
@@ -202,9 +203,22 @@ class DailyTSDataset(Dataset):
                  *,
                  return_coords: bool = False,
                  return_month: bool = False,
+                 time_variant: str = 'monthly',
                  z_feature_indices: Optional[List[int]] = None,
                  z_scaler_range: Optional[Tuple[float, float]] = None,
                  ncar_path: Optional[str] = None) -> None:
+        """Instantiate the daily dataset.
+
+        Parameters
+        ----------
+        return_coords: bool
+            Whether to return (lat, lon) coordinates for each sample.
+        return_month: bool
+            If True, return a temporal index (month or day-of-year) for each sample.
+        time_variant: str
+            Determines how the temporal index is interpreted.  ``'monthly'`` returns
+            month indices (1-12); ``'doy'`` returns day-of-year indices (1-365/366).
+        """
         super().__init__()
         self.root = root
         self.dates = iter_dates(start_date, end_date)
@@ -218,9 +232,27 @@ class DailyTSDataset(Dataset):
 
         # Flags controlling auxiliary outputs
         self.return_coords = bool(return_coords)
+        # ``return_month`` indicates whether a temporal index (month or day-of-year)
+        # should be returned.  The interpretation of the index is controlled by
+        # ``time_variant`` (see below).  We keep the original name for backwards
+        # compatibility.
         self.return_month = bool(return_month)
+        # Determine how to interpret temporal indices.  If ``time_variant`` is
+        # 'doy', day-of-year indices (1-365/366) will be used; otherwise month
+        # indices (1-12) are used.
+        self.time_variant = str(time_variant or 'monthly').lower()
+        self.use_month = self.time_variant == 'monthly'
+        self.use_doy = self.time_variant == 'doy'
         self.z_feature_indices = list(z_feature_indices or [])
         self.return_z = len(self.z_feature_indices) > 0
+
+        # Update the module-level default variant for NCAR sampling.  This allows
+        # ``sample_ncar_points`` to return day-of-year indices when the dataset
+        # was created with ``time_variant='doy'`` but the caller does not
+        # explicitly pass a ``time_variant``.  Without this, NCAR sampling
+        # during training would always default to months.
+        global _DEFAULT_TIME_VARIANT
+        _DEFAULT_TIME_VARIANT = self.time_variant
 
         self.keep_feat_idx: Optional[List[int]] = None
         self.file_meta: List[Dict] = []
@@ -293,13 +325,21 @@ class DailyTSDataset(Dataset):
             for rid in valid_idx:
                 index_map.append((fid, int(rid)))
                 coords_list.append((float(latvec[rid]), float(lonvec[rid])))
-                # compute the month (1-12) corresponding to this file/date
+                # compute the temporal index corresponding to this file/date
                 try:
                     date_str = self.dates[fid]
-                    mth = int(date_str.split("-")[1])
+                    if self.use_doy:
+                        # Use pandas to compute day-of-year; fallback to 1 if parsing fails
+                        t_idx = int(pd.to_datetime(date_str, format=DATE_FMT, errors='coerce').dayofyear)
+                        # pandas returns NaN if parsing fails; treat as invalid
+                        if np.isnan(t_idx):
+                            raise ValueError("Invalid date")
+                    else:
+                        # month (1-12)
+                        t_idx = int(date_str.split("-")[1])
                 except Exception:
-                    mth = 1
-                months_list.append(mth)
+                    t_idx = 1
+                months_list.append(t_idx)
             self.file_meta.append({
                 'x_path': xp,
                 'y_path': yp,
@@ -372,22 +412,23 @@ class DailyTSDataset(Dataset):
 
 _NCAR_CACHE: Dict[str, np.ndarray] = {}
 
+# Global default temporal variant used by ``sample_ncar_points`` when no explicit
+# ``time_variant`` argument is provided.  This value is updated in
+# ``DailyTSDataset.__init__`` based on the ``time_variant`` passed to the
+# dataset constructor.  If no dataset has been instantiated, it defaults
+# to 'monthly'.
+_DEFAULT_TIME_VARIANT: str = 'monthly'
+
 
 def load_ncar_grid(ncar_path: str) -> None:
     """Load NCAR parquet files and cache arrays for random sampling.
 
     This function reads all ``*.parquet`` files under ``ncar_path`` and
     extracts the minimum and maximum latitudes and longitudes for each
-    grid cell, the PM25_TOT target and the month index derived from the
-    ``date`` column.  The resulting arrays are stored in a module‑level
-    cache so that subsequent calls to ``sample_ncar_points`` can reuse
-    them without reloading the parquet files.
-
-    Parameters
-    ----------
-    ncar_path: str
-        Directory containing parquet files, one per month, with columns
-        ``['lat_nw','lon_nw','lat_ne','lon_ne','lat_se','lon_se','lat_sw','lon_sw','PM25_TOT','date']``.
+    grid cell, the PM25_TOT target and both month and day-of-year indices
+    derived from the ``date`` column.  The resulting arrays are stored in a
+    module-level cache so that subsequent calls to ``sample_ncar_points``
+    can reuse them without reloading the parquet files.
     """
     if 'lat_min' in _NCAR_CACHE:
         return  # already loaded
@@ -416,13 +457,17 @@ def load_ncar_grid(ncar_path: str) -> None:
     _NCAR_CACHE['lon_max'] = corners_lon.max(axis=1)
     _NCAR_CACHE['z'] = df_all['PM25_TOT'].to_numpy(dtype=float)
     try:
-        months = pd.to_datetime(df_all['date']).dt.month.to_numpy(dtype=int)
+        dt = pd.to_datetime(df_all['date'])
+        months = dt.dt.month.to_numpy(dtype=int)
+        doys = dt.dt.dayofyear.to_numpy(dtype=int)
     except Exception:
         months = np.ones(len(df_all), dtype=int)
+        doys = np.ones(len(df_all), dtype=int)
     _NCAR_CACHE['month'] = months
+    _NCAR_CACHE['doy'] = doys
 
 
-def sample_ncar_points(num_samples: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Sample random NCAR points uniformly within grid cells.
 
     Parameters
@@ -430,13 +475,16 @@ def sample_ncar_points(num_samples: int) -> Tuple[np.ndarray, np.ndarray, np.nda
     num_samples: int
         Number of random points to sample.  If zero or the NCAR cache is
         empty, returns empty arrays.
+    time_variant: str
+        Either 'monthly' or 'doy'.  Determines whether month (1-12) or day-of-year
+        (1-365/366) indices are returned for the sampled points.
 
     Returns
     -------
     coords : ndarray of shape [N,2]
         Sampled latitude/longitude coordinates (lat, lon).
-    months : ndarray of shape [N]
-        Month indices (1‑12) corresponding to the sampled points.
+    time_vals : ndarray of shape [N]
+        Temporal indices corresponding to the sampled points.
     z_vals : ndarray of shape [N]
         Physical target values (PM25_TOT) for the sampled points.
     """
@@ -452,6 +500,7 @@ def sample_ncar_points(num_samples: int) -> Tuple[np.ndarray, np.ndarray, np.nda
     lon_max = _NCAR_CACHE['lon_max']
     z_vals_full = _NCAR_CACHE['z']
     months_full = _NCAR_CACHE['month']
+    doys_full = _NCAR_CACHE.get('doy', months_full)
     # Randomly select rows
     idxs = np.random.randint(0, len(lat_min), size=int(num_samples))
     lat_low = lat_min[idxs]
@@ -461,6 +510,14 @@ def sample_ncar_points(num_samples: int) -> Tuple[np.ndarray, np.ndarray, np.nda
     lats = lat_low + np.random.rand(int(num_samples)) * (lat_hi - lat_low)
     lons = lon_low + np.random.rand(int(num_samples)) * (lon_hi - lon_low)
     coords = np.stack([lats, lons], axis=1)
-    months = months_full[idxs]
+    # Choose the appropriate temporal indices based on time_variant.  If none
+    # provided, fall back to the module-level default set by
+    # ``DailyTSDataset.__init__``.
+    variant = str(time_variant or _DEFAULT_TIME_VARIANT or 'monthly').lower()
+    if variant == 'doy':
+        time_full = doys_full
+    else:
+        time_full = months_full
+    time_vals = time_full[idxs]
     z_vals = z_vals_full[idxs]
-    return coords.astype(float), months.astype(int), z_vals.astype(float)
+    return coords.astype(float), time_vals.astype(int), z_vals.astype(float)
