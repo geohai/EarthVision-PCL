@@ -1,18 +1,12 @@
 """SIREN location encoder modules for LOC4PM.
 
-This module implements a sinusoidal representation network (SIREN) and a
-residual variant (ReSIREN) based on the implementation from the `rshf`
-repository.  It exposes a single class, :class:`SirenNet`, which can be
-configured to operate with or without residual connections (``residual_connections``)
-and with optional H‑SIREN activation (``h_siren``).
-
-The network consists of a stack of sinusoidal layers followed by a final
-linear layer.  When ``residual_connections`` is enabled, the intermediate
-pre‑activation (Gaussian) outputs are averaged with the previous layer's
-Gaussian prior to applying the sinusoidal activation, forming the
-residual connection proposed in ReSIREN.
-
-See the original SIREN paper (Sitzmann et al., 2020) for details.
+This module implements sinusoidal representation networks (SIREN) and their
+residual variant (ReSIREN) as well as a convenience wrapper for creating a
+location encoder that optionally augments normalized coordinates with a
+temporal sinusoidal input.  The temporal input can be monthly (1–12) or
+day‑of‑year (1–365) and is encoded via ``sin`` and ``cos`` of the appropriate
+phase.  See the original SIREN paper (Sitzmann et al., 2020) for details on
+the architecture.
 """
 
 from __future__ import annotations
@@ -26,7 +20,7 @@ import torch.nn.functional as F
 
 from .direct import Direct
 
-__all__ = ["SirenNet", "Siren", "Sine"]
+__all__ = ["SirenNet", "Siren", "Sine", "DirectSirenEncoder"]
 
 
 class Sine(nn.Module):
@@ -34,7 +28,7 @@ class Sine(nn.Module):
 
     Parameters
     ----------
-    w0: float, default=1.0
+    w0 : float, default=1.0
         Frequency scaling factor applied to the input before the sine.
     """
 
@@ -58,30 +52,30 @@ class Siren(nn.Module):
 
     Parameters
     ----------
-    dim_in: int
+    dim_in : int
         Input dimensionality.
-    dim_out: int
+    dim_out : int
         Output dimensionality.
-    w0: float, default=1.0
+    w0 : float, default=1.0
         Base frequency of the sine activation for layers beyond the first.
-    c: float, default=6.0
+    c : float, default=6.0
         Scaling constant for the weight initialization.
-    is_first: bool, default=False
+    is_first : bool, default=False
         Whether this layer is the first layer in the network.  First
         layers receive a higher frequency (``w0_initial``) and different
         initialization.
-    use_bias: bool, default=True
+    use_bias : bool, default=True
         Whether to include a learnable bias term.
-    activation: Optional[nn.Module], default=None
+    activation : Optional[nn.Module], default=None
         Optional custom activation.  If ``None``, a sine with frequency
         ``w0`` is used.
-    dropout: bool, default=False
+    dropout : bool, default=False
         Whether to apply dropout after the linear transform.
-    residual_connections: bool, default=False
+    residual_connections : bool, default=False
         If True, the layer expects a ``prev_gaussian`` tensor when
         called and averages it with the current Gaussian before
         activation, forming a residual connection across layers.
-    h_siren: bool, default=False
+    h_siren : bool, default=False
         Whether to use the hyperbolic sine activation on the first layer.
     """
 
@@ -117,7 +111,7 @@ class Siren(nn.Module):
         self.activation: nn.Module = activation if activation is not None else Sine(w0)
 
     def _init_weights(self, weight: torch.Tensor, bias: Optional[torch.Tensor], *, c: float, w0: float) -> None:
-        """Initialize weights following SIREN initialization scheme."""
+        """Initialize weights following the SIREN initialization scheme."""
         dim = self.dim_in
         # Use a higher standard deviation for the first layer
         w_std = (1.0 / dim) if self.is_first else (math.sqrt(c / dim) / w0)
@@ -156,31 +150,31 @@ class SirenNet(nn.Module):
 
     Parameters
     ----------
-    dim_in: int
+    dim_in : int
         Dimensionality of the input.
-    dim_hidden: int
+    dim_hidden : int
         Hidden dimension for the intermediate SIREN layers.
-    dim_out: int
+    dim_out : int
         Dimension of the output embedding.
-    num_layers: int
+    num_layers : int
         Number of hidden SIREN layers prior to the final linear layer.
-    w0: float, default=1.0
+    w0 : float, default=1.0
         Frequency of the sine activation for layers beyond the first.
-    w0_initial: float, default=30.0
+    w0_initial : float, default=30.0
         Frequency of the sine activation for the first layer.  Higher values
         allow the network to represent higher‑frequency signals.
-    use_bias: bool, default=True
+    use_bias : bool, default=True
         Whether to include biases in the linear transformations.
-    final_activation: Optional[nn.Module], default=None
+    final_activation : Optional[nn.Module], default=None
         Activation to apply to the output of the final layer.  If ``None``,
         no activation is applied (identity).
-    dropout: bool, default=False
+    dropout : bool, default=False
         If True, apply dropout in the hidden SIREN layers.
-    residual_connections: bool, default=False
+    residual_connections : bool, default=False
         Whether to average Gaussians across layers (ReSIREN).
-    h_siren: bool, default=False
+    h_siren : bool, default=False
         Whether to use H‑SIREN activation for the first layer.
-    return_hidden_embs: Optional[Iterable[int]], default=None
+    return_hidden_embs : Optional[Iterable[int]], default=None
         Indices of hidden layers whose embeddings should be returned.  If
         provided, the final output is a concatenation of these hidden
         embeddings and the final layer output.
@@ -244,9 +238,9 @@ class SirenNet(nn.Module):
 
         Args
         ----
-        x: torch.Tensor
+        x : torch.Tensor
             Input tensor of shape ``[B, dim_in]``.
-        mods: Optional[torch.Tensor]
+        mods : Optional[torch.Tensor]
             Unused placeholder for compatibility with some HuggingFace model
             signatures.  Ignored in this implementation.
 
@@ -273,18 +267,40 @@ class SirenNet(nn.Module):
 
 class DirectSirenEncoder(nn.Module):
     """
-    rshf-style location encoder:
-      coords -> Direct(lon/lat normalization) -> [ + sin/cos(month) ] -> SirenNet
+    rshf‑style location encoder with optional temporal sinusoidal input.
 
-    Args:
-      emb_dim:   output embedding dim (what the caller expects to receive)
-      dim_hidden: hidden size inside SirenNet (e.g., 512 like climplicit)
-      num_layers: number of Siren layers (e.g., 16 like climplicit)
-      residual:  if True, ReSIREN (residual connections)
-      h_siren:   if True, H-SIREN (sinh on first layer)
-      w0, w0_initial: SIREN frequencies (lower w0_initial is safer)
-      monthly:   append sin/cos(month) to Direct output
+    This encoder normalizes geographic coordinates into the range ``[-1,1]``
+    using :class:`Direct` and feeds them through a :class:`SirenNet`.  When
+    configured with a temporal variant, it appends a two‑dimensional
+    sinusoidal encoding of a temporal index to the spatial coordinates.  The
+    supported temporal variants are ``"monthly"`` (month index 1–12) and
+    ``"doy"`` (day‑of‑year index 1–365).  If neither variant is enabled,
+    only the spatial coordinates are used.
+
+    Parameters
+    ----------
+    emb_dim : int, default=256
+        Output embedding dimension produced by the internal :class:`SirenNet`.
+    dim_hidden : int, default=512
+        Hidden dimension inside the :class:`SirenNet`.
+    num_layers : int, default=16
+        Number of SIREN layers.
+    residual : bool, default=True
+        If ``True``, enable residual (ReSIREN) connections between SIREN layers.
+    h_siren : bool, default=True
+        If ``True``, use hyperbolic sine (sinh) on the first layer as in H‑SIREN.
+    w0 : float, default=1.0
+        Base frequency for SIREN activations beyond the first layer.
+    w0_initial : float, default=10.0
+        Frequency for the first SIREN layer.
+    monthly : bool, default=False
+        Legacy flag to enable the ``monthly`` variant.  When ``variant`` is
+        provided this flag is ignored.
+    variant : Optional[str], default=None
+        Optional temporal variant.  Accepts ``"monthly"`` or ``"doy"`` to
+        specify the temporal encoding.  Overrides the ``monthly`` flag.
     """
+
     def __init__(
         self,
         emb_dim: int = 256,
@@ -293,15 +309,24 @@ class DirectSirenEncoder(nn.Module):
         residual: bool = True,
         h_siren: bool = True,
         w0: float = 1.0,
-        w0_initial: float = 10.0,  # safer than 30.0; raise to match rshf exactly
+        w0_initial: float = 10.0,
         monthly: bool = False,
+        variant: Optional[str] = None,
     ) -> None:
         super().__init__()
-        self.monthly = bool(monthly)
-        # rshf uses lon in [-180, 180], lat in [-90, 90]
+        # Determine temporal variant.
+        self.variant = str(variant).lower() if variant is not None else None
+        if self.variant is None:
+            self.monthly = False
+            self.doy = False
+        else:
+            self.monthly = self.variant == "monthly"
+            self.doy = self.variant == "doy"
+        # Normalize lon/lat into [-1,1]
         self.pos = Direct(lon_min=-180, lon_max=180, lat_min=-90, lat_max=90)
-
-        dim_in = 4 if self.monthly else 2  # [lon,lat] + [sin(m),cos(m)] if monthly
+        # Input dimension: 2 (lon,lat) plus 2 for sin/cos if a temporal variant is enabled
+        dim_in = 4 if (self.monthly or self.doy) else 2
+        # Construct SIREN network
         self.siren = SirenNet(
             dim_in=dim_in,
             dim_hidden=dim_hidden,
@@ -313,20 +338,43 @@ class DirectSirenEncoder(nn.Module):
             h_siren=h_siren,
         )
 
-    def forward(self, coords: torch.Tensor, month: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(self, coords: torch.Tensor, month: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        coords: [B,2] in (lat, lon) — converts to (lon,lat) for Direct
-        month:  [B] or [B,1], 1..12 (optional; only used if self.monthly=True)
+        Compute a SIREN location embedding for the given coordinates and optional temporal index.
+
+        Parameters
+        ----------
+        coords : torch.Tensor
+            Tensor of shape ``[B, 2]`` containing latitude and longitude in degrees
+            as ``(lat, lon)``.  Internally, the tensor is reordered to ``(lon, lat)``
+            for normalization.
+        month : Optional[torch.Tensor], default=None
+            Temporal index tensor.  When ``variant="monthly"`` this should contain
+            month indices in 1–12.  When ``variant="doy"`` this should contain
+            day‑of‑year indices in 1–365.  If no temporal variant is enabled this
+            argument is ignored.
+
+        Returns
+        -------
+        torch.Tensor
+            Location embedding of shape ``[B, emb_dim]``.
         """
         if coords is None:
             raise ValueError("coords is required for DirectSirenEncoder")
-        # reorder to (lon, lat) for Direct
+        # Reorder to (lon, lat) for Direct scaling
         lonlat = torch.stack([coords[:, 1], coords[:, 0]], dim=1)
         loc = self.pos(lonlat)  # shape [B, 2]
-
-        if self.monthly and (month is not None):
+        # Append temporal sin/cos features if enabled and provided
+        if (self.monthly or self.doy) and (month is not None):
+            # Flatten to [B]
             m = month.float().squeeze(-1) if month.dim() > 1 else month.float()
-            phi = m / 12.0 * (2.0 * math.pi)
-            loc = torch.cat([loc, torch.sin(phi).unsqueeze(-1), torch.cos(phi).unsqueeze(-1)], dim=1)  # [B,4]
-
+            # Choose denominator based on variant
+            denom = 12.0 if self.monthly else 365.2425
+            phi = m / denom * (2.0 * math.pi)
+            # Concatenate sin and cos of phi
+            loc = torch.cat([
+                loc,
+                torch.sin(phi).unsqueeze(-1),
+                torch.cos(phi).unsqueeze(-1),
+            ], dim=1)
         return self.siren(loc)

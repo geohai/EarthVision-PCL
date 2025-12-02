@@ -2,11 +2,13 @@
 
 This module extends the baseline BiLSTM with Luong attention by optionally
 incorporating a geolocation encoder.  Supported encoders include the
-Climplicit, GeoCLIP and SatCLIP models from the `rshf` package as well
-as sinusoidal representation networks (SIREN) implemented locally in
-``loc4pm.models.siren``.  If a requested encoder cannot be imported, a
-simple MLP fallback is used to map the latitude/longitude (and
-optionally a month index) to a fixed‑size embedding.
+Climplicit, GeoCLIP and SatCLIP models from the ``rshf`` package as well
+as local SIREN implementations (:mod:`loc4pm.models.siren`) and an
+RFF‑based location encoder (:mod:`loc4pm.models.rff_encoder`).
+
+If a requested encoder cannot be imported, a simple MLP fallback is used to
+map the latitude/longitude (and optionally a temporal index) to a fixed‑size
+embedding.
 """
 
 from __future__ import annotations
@@ -18,7 +20,8 @@ import torch
 import torch.nn as nn
 
 from .bilstm_attn import LuongAttention
-from .siren import SirenNet, DirectSirenEncoder
+from .siren import DirectSirenEncoder
+from .rff_encoder import RFFLocationEncoder
 
 _LOG = logging.getLogger(__name__)
 
@@ -31,11 +34,13 @@ class LocationEncoderWrapper(nn.Module):
     This helper attempts to construct a location encoder according to
     user configuration.  Supported encoders include:
 
-    * ``climplicit`` – the Climplicit encoder from the `rshf` package.
-    * ``geoclip`` – the GeoCLIP encoder from `rshf`.
-    * ``satclip`` – the SatCLIP encoder from `rshf`.
-    * ``sirennet`` / ``siren`` – a local SIREN implementation with no residual connections.
-    * ``resirennet`` / ``resiren`` – a local ReSIREN implementation with residual connections.
+    * ``climplicit`` – the Climplicit encoder from the ``rshf`` package.
+    * ``geoclip`` – the GeoCLIP encoder from ``rshf``.
+    * ``satclip`` – the SatCLIP encoder from ``rshf``.
+    * ``siren`` / ``resiren`` – a local SIREN or ReSIREN implementation with
+      optional temporal variants (monthly or day‑of‑year).
+    * ``rff`` – a local random Fourier feature encoder with optional
+      day‑of‑year temporal encoding.
 
     If the specified encoder name is ``None`` or ``"none"``, the wrapper
     constructs an identity mapping.  If the import fails or the encoder
@@ -78,7 +83,7 @@ class LocationEncoderWrapper(nn.Module):
                     encoder_loaded = True
                 elif lname == 'geoclip':
                     # GeoCLIP expects coordinates in [lat, lon] order.
-                    from rshf.geoclip import GeoCLIP, GeoCLIPConfig
+                    from rshf.geoclip import GeoCLIP, GeoCLIPConfig  # type: ignore
                     model_name = "MVRL/geoclip-location-encoder"
                     if pretrained:
                         self.encoder = GeoCLIP.from_pretrained(model_name)
@@ -96,8 +101,9 @@ class LocationEncoderWrapper(nn.Module):
                         self.encoder = SatClip()
                     encoder_loaded = True
                 elif lname in ('siren', 'resiren'):
-                    # rshf-style composition: Direct -> SIREN
-                    monthly = bool(variant and str(variant).lower() == 'monthly')
+                    # rshf‑style composition: Direct -> SIREN with optional temporal variant
+                    var = str(self.variant).lower() if self.variant is not None else None
+                    monthly_flag = (var == 'monthly') if var is not None else bool(self.variant and str(self.variant).lower() == 'monthly')
                     self.encoder = DirectSirenEncoder(
                         emb_dim=emb_dim,
                         dim_hidden=max(emb_dim, 512),  # 512 matches climplicit
@@ -106,7 +112,21 @@ class LocationEncoderWrapper(nn.Module):
                         h_siren=True,
                         w0=1.0,
                         w0_initial=30.0,  # set 30.0 to mirror rshf exactly
-                        monthly=monthly,
+                        monthly=monthly_flag,
+                        variant=var,
+                    )
+                    encoder_loaded = True
+                elif lname == 'rff':
+                    # Local RFF encoder with optional day‑of‑year branch
+                    var = str(self.variant).lower() if self.variant is not None else None
+                    # Use similar hidden dimension as SIREN for consistency
+                    hidden_dim = max(emb_dim, 512)
+                    self.encoder = RFFLocationEncoder(
+                        emb_dim=emb_dim,
+                        sigma=(2.0, 4.0),
+                        encoded_size=256,
+                        dim=hidden_dim,
+                        variant=var,
                     )
                     encoder_loaded = True
             except ImportError:
@@ -124,8 +144,10 @@ class LocationEncoderWrapper(nn.Module):
 
         # If no external or local encoder was loaded, create a simple MLP fallback
         if not encoder_loaded or self.encoder is None:
-            # Determine input dimensionality: lat+lon, plus optional month
-            input_dim = 2 + (1 if variant and str(variant).lower() == 'monthly' else 0)
+            # Determine whether a temporal input should be consumed
+            var_l = str(self.variant).lower() if self.variant is not None else None
+            has_temporal = var_l in ('monthly', 'doy') if var_l is not None else False
+            input_dim = 2 + (1 if has_temporal else 0)
             hidden_dim = max(emb_dim, 64)
             self.encoder = nn.Sequential(
                 nn.Linear(input_dim, hidden_dim),
@@ -152,12 +174,14 @@ class LocationEncoderWrapper(nn.Module):
     def forward(self, coords: torch.Tensor, month: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute a location embedding.
 
-        Args
-        ----
-        coords: torch.Tensor
+        Parameters
+        ----------
+        coords : torch.Tensor
             Tensor of shape ``[B, 2]`` containing latitude and longitude in degrees.
-        month: Optional[torch.Tensor], default=None
-            Optional tensor of shape ``[B]`` or ``[B,1]`` containing month indices (1‑12).
+        month : Optional[torch.Tensor], default=None
+            Optional tensor of shape ``[B]`` or ``[B,1]`` containing temporal
+            indices.  Its interpretation depends on the variant: month (1–12) for
+            ``variant="monthly"`` or day‑of‑year (1–365) for ``variant="doy"``.
 
         Returns
         -------
@@ -187,15 +211,11 @@ class LocationEncoderWrapper(nn.Module):
             # SatCLIP expects [lon, lat]
             xy = torch.stack([coords[:, 1], coords[:, 0]], dim=1)
             out = self.encoder(xy)
-        elif lname in ('siren', 'resiren'):
-            # For local SIREN models we concatenate coords and optional month if needed
-            if month is not None:
-                inp = torch.cat([coords, month.unsqueeze(-1)], dim=1)
-            else:
-                inp = coords
-            out = self.encoder(inp)
+        elif lname in ('siren', 'resiren', 'rff'):
+            # For local encoders we delegate handling of the temporal index
+            out = self.encoder(coords, month)
         else:
-            # Fallback MLP: concatenate coords and (optionally) month
+            # Fallback MLP: concatenate coords and (optionally) temporal index
             if month is not None:
                 inp = torch.cat([coords, month.unsqueeze(-1)], dim=1)
             else:
@@ -239,12 +259,12 @@ class BiLSTMAttnLocRegressor(nn.Module):
         loc_pretrained: bool = True,
         loc_freeze: bool = True,
         loc_proj_dim: Optional[int] = None,
-         fusion_method: str = 'concat',
-         fusion_hidden_dim: int = 256,
-         physical_head_hidden_dim: Optional[int] = None,
-         physical_out_dim: int = 0,
-         head_dropout: Optional[float] = None,
-     ) -> None:
+        fusion_method: str = 'concat',
+        fusion_hidden_dim: int = 256,
+        physical_head_hidden_dim: Optional[int] = None,
+        physical_out_dim: int = 0,
+        head_dropout: Optional[float] = None,
+    ) -> None:
         super().__init__()
         # Sequence branch: BiLSTM producing temporal embeddings
         self.lstm = nn.LSTM(
@@ -322,15 +342,17 @@ class BiLSTMAttnLocRegressor(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
         """Forward pass through the model.
 
-        Args
-        ----
-        x: torch.Tensor
+        Parameters
+        ----------
+        x : torch.Tensor
             Tensor of shape ``[B, T, F]`` containing the time‑series input.
-        coords: Optional[torch.Tensor], default=None
+        coords : Optional[torch.Tensor], default=None
             Optional tensor of shape ``[B, 2]`` with (lat, lon) per sample.
-        month: Optional[torch.Tensor], default=None
-            Optional tensor of shape ``[B]`` or ``[B,1]`` with month indices (1‑12).
-        mask: Optional[torch.Tensor], default=None
+        month : Optional[torch.Tensor], default=None
+            Optional tensor of shape ``[B]`` or ``[B,1]`` with temporal indices.  The
+            interpretation depends on the encoder variant: month (1–12) for
+            ``variant="monthly"`` or day‑of‑year (1–365) for ``variant="doy"``.
+        mask : Optional[torch.Tensor], default=None
             Optional tensor indicating valid positions in ``x`` (unused in current implementation).
 
         Returns
