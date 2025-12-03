@@ -1,139 +1,332 @@
-"""Random Fourier feature based location encoder for LOC4PM.
-
-This module implements a simple random Fourier feature (RFF) location encoder
-that mirrors the GeoCLIP architecture but adds an optional temporal branch
-encoding the day of the year (DOY).  The spatial branch encodes the
-normalized longitude/latitude coordinates using a Gaussian RFF and the
-temporal branch (if enabled) encodes a normalized day‑of‑year scalar.  The
-resulting features are passed through a lightweight multi‑layer perceptron
-("capsule") followed by a linear head to produce a fixed‑size embedding.
-
-The RFF encoder is designed to be a drop‑in alternative to the GeoCLIP
-location encoder and can be selected via ``loc_name="rff"`` in the model
-configuration.  When ``variant="doy"`` the temporal branch is enabled and
-expects the ``month`` argument of the ``forward`` method to contain day‑of‑year
-indices (1–365).  For other variants or when ``variant`` is ``None``, only
-the spatial branch is used.
-"""
-
 from __future__ import annotations
 
-from typing import Optional, Sequence
-
 import math
-import torch
-from torch import nn
+from typing import Optional, Sequence, Union
 
-from .gaussian_encoding import GaussianEncoding
-from .direct import Direct
+import torch
+import torch.nn as nn
+
 
 __all__ = ["RFFLocationEncoder"]
 
+Tensor = torch.Tensor
 
-class RFFLocationEncoder(nn.Module):
-    """Random Fourier feature based location encoder with optional temporal branch.
+
+def equal_earth_projection(coords: Tensor) -> Tensor:
+    """
+    Equal Earth projection (Savric et al., 2018).
 
     Parameters
     ----------
-    emb_dim : int, default=256
-        Output embedding dimension.  The final head will map the intermediate
-        representation to this size.
-    sigma : Sequence[float], default=(2.0, 4.0)
-        Standard deviations for the Gaussian kernels used in the spatial RFF.
-        Multiple values will produce features at different spatial frequencies.
-    encoded_size : int, default=256
-        Number of random features to draw *per sigma* for the spatial branch.
-    dim : int, default=512
-        Hidden dimension inside the capsule network.  The intermediate
-        representation after concatenation of the RFF encodings is projected
-        through three ``dim->2*dim`` layers before being mapped to ``emb_dim``.
-    variant : Optional[str], default=None
-        Temporal variant to enable.  If ``"doy"`` (case‑insensitive), the
-        encoder will accept a day‑of‑year tensor in the ``month`` argument
-        of ``forward`` and apply an additional RFF encoding to it.
+    coords : Tensor
+        [..., 2] with latitude and longitude in *radians* (lat, lon).
+
+    Returns
+    -------
+    Tensor
+        [..., 2] with projected (y, x) coordinates.
+    """
+    if coords.shape[-1] != 2:
+        raise ValueError(f"equal_earth_projection expects [...,2], got {coords.shape}")
+    lat = coords[..., 0]
+    lon = coords[..., 1]
+
+    # Equal Earth constants (same as in the original paper).
+    A1 = 1.340264
+    A2 = -0.081106
+    A3 = 0.000893
+    A4 = 0.003796
+
+    sin_theta = (math.sqrt(3.0) / 2.0) * torch.sin(lat)
+    theta = torch.asin(torch.clamp(sin_theta, -1.0, 1.0))
+
+    theta2 = theta * theta
+    theta4 = theta2 * theta2
+    theta6 = theta4 * theta2
+    theta8 = theta4 * theta4
+
+    denom = 3.0 * (9.0 * A4 * theta8 + 7.0 * A3 * theta6 + 3.0 * A2 * theta2 + A1)
+    x = 2.0 * math.sqrt(3.0) * lon * torch.cos(theta) / denom
+    y = A4 * theta * theta8 + A3 * theta * theta6 + A2 * theta * theta2 + A1 * theta
+
+    # Return (lat_like, lon_like) ordering to stay consistent with [lat, lon].
+    return torch.stack((y, x), dim=-1)
+
+
+class GaussianEncoding(nn.Module):
+    """
+    Random Fourier feature (Gaussian) encoding.
+
+    Mirrors the functional form of rff.functional.gaussian_encoding:
+
+        gamma(v) = [cos(2 pi B v), sin(2 pi B v)]
+
+    where B ~ N(0, sigma^2).
+
+    Parameters
+    ----------
+    sigma : float
+        Standard deviation of the Gaussian used to sample B.
+    input_size : int
+        Dimensionality of input vectors.
+    encoded_size : int
+        Number of rows of B. Output dim is 2 * encoded_size.
+    """
+
+    def __init__(self, sigma: float, input_size: int = 2, encoded_size: int = 256) -> None:
+        super().__init__()
+        self.sigma = float(sigma)
+        self.input_size = int(input_size)
+        self.encoded_size = int(encoded_size)
+
+        # Projection matrix B: [encoded_size, input_size].
+        B = torch.randn(self.encoded_size, self.input_size) * self.sigma
+        self.register_buffer("B", B)
+
+    @property
+    def out_dim(self) -> int:
+        return 2 * self.encoded_size
+
+    def forward(self, v: Tensor) -> Tensor:
+        """
+        v : [B, input_size]  ->  [B, 2 * encoded_size]
+        """
+        if v.dim() != 2 or v.size(-1) != self.input_size:
+            raise ValueError(
+                f"GaussianEncoding expects [B,{self.input_size}], got {tuple(v.shape)}"
+            )
+        # [B, encoded_size]
+        proj = torch.matmul(v, self.B.t())
+        proj = 2.0 * math.pi * proj
+        return torch.cat((torch.cos(proj), torch.sin(proj)), dim=-1)
+
+
+class _RFFBlock(nn.Module):
+    """
+    Single-scale RFF + MLP block f_i(γ(·, σ_i)), i.e. one term in Eq. (3) of GeoCLIP.
+    """
+
+    def __init__(
+        self,
+        sigma: float,
+        input_size: int = 2,
+        encoded_size: int = 256,
+        dim: int = 512,
+    ) -> None:
+        super().__init__()
+        self.encoding = GaussianEncoding(
+            sigma=sigma, input_size=input_size, encoded_size=encoded_size
+        )
+        self.mlp = nn.Sequential(
+            nn.Linear(self.encoding.out_dim, dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim, dim),
+            nn.ReLU(inplace=True),
+        )
+        self.out_dim = dim
+
+    def forward(self, v: Tensor) -> Tensor:
+        rff = self.encoding(v)
+        return self.mlp(rff)
+
+
+class RFFLocationEncoder(nn.Module):
+    """
+    GeoCLIP-style location encoder with optional temporal RFF branch.
+
+    Spatial branch
+    --------------
+    Implements:
+
+        L(G) = sum_i f_i(γ(EEP(G), σ_i))
+
+    with multiple _RFFBlock's (different σ_i) summed element-wise.
+
+    Temporal branch
+    ---------------
+    Activated when `variant` contains "doy" or "monthly".
+
+    * Input is a scalar index (month or DOY).
+    * We convert to angle and then to (sin, cos) before RFF so that the
+      temporal representation is explicitly cyclic.
+    * Temporal branch is also a sum of _RFFBlock's, with its own σ list
+      (defaults to the spatial σ list).
+
+    Fusion mode is encoded in `variant`:
+
+        variant="doy"          -> add  (spatial + temporal)
+        variant="doy-hadamard" -> hadamard (spatial * temporal)
+        variant="doy-concat"   -> concat + small MLP
+
+    Parameters
+    ----------
+    emb_dim : int
+        Output embedding dimension (what the fusion head will see).
+    sigma : float or Sequence[float]
+        σ values for spatial RFF hierarchy.
+    encoded_size : int
+        Encoded size per RFF layer (before trig).
+    dim : int
+        Hidden dimension for per-scale MLPs.
+    variant : Optional[str]
+        Temporal encoding variant.  If None or does not contain "doy" /
+        "monthly", the encoder is purely spatial.
+    temporal_sigma : Optional[float or Sequence[float]]
+        σ values for temporal RFF hierarchy.  If None, reuse spatial σ list.
     """
 
     def __init__(
         self,
         emb_dim: int = 256,
-        sigma: Sequence[float] = (2.0, 4.0),
+        sigma: Union[float, Sequence[float]] = (2.0, 4.0),
         encoded_size: int = 256,
         dim: int = 512,
         variant: Optional[str] = None,
+        temporal_sigma: Optional[Union[float, Sequence[float]]] = None,
     ) -> None:
         super().__init__()
-        self.emb_dim = int(emb_dim)
-        self.variant = str(variant).lower() if variant is not None else None
-        self.use_temporal = self.variant == "doy"
-        # Normalize lon/lat into [-1, 1] range using Direct
-        self.pos = Direct(lon_min=-180, lon_max=180, lat_min=-90, lat_max=90)
-        # Spatial RFF encoder: encodes 2D position into a high dimensional feature
-        self.spatial_enc = GaussianEncoding(sigma=sigma, input_size=2, encoded_size=encoded_size)
-        # Temporal RFF encoder: encodes day‑of‑year (scalar) if requested
-        # Use the same sigma values as the spatial branch for simplicity
-        if self.use_temporal:
-            self.temporal_enc = GaussianEncoding(sigma=sigma, input_size=1, encoded_size=encoded_size)
-        # Feature dimensionalities
-        spatial_feat_dim = 2 * encoded_size * len(self.spatial_enc.sigmas)
-        temporal_feat_dim = 2 * encoded_size * len(sigma) if self.use_temporal else 0
-        total_feat_dim = spatial_feat_dim + temporal_feat_dim
-        # Capsule: three linear layers with ReLU, doubling hidden dimension each time
-        self.capsule = nn.Sequential(
-            nn.Linear(total_feat_dim, 2 * dim),
-            nn.ReLU(),
-            nn.Linear(2 * dim, 2 * dim),
-            nn.ReLU(),
-            nn.Linear(2 * dim, 2 * dim),
-            nn.ReLU(),
+
+        self.emb_dim = emb_dim
+        self.encoded_size = encoded_size
+        self.hidden_dim = dim
+
+        # --- Spatial hierarchy (GeoCLIP-style) ---
+        if isinstance(sigma, (float, int)):
+            sigma_list = [float(sigma)]
+        else:
+            sigma_list = [float(s) for s in sigma]
+
+        self.spatial_blocks = nn.ModuleList(
+            [
+                _RFFBlock(s, input_size=2, encoded_size=encoded_size, dim=dim)
+                for s in sigma_list
+            ]
         )
-        # Head: project to emb_dim
-        self.head = nn.Linear(2 * dim, self.emb_dim)
 
-    def forward(self, coords: torch.Tensor, time: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Encode location (and optional day‑of‑year) into a dense embedding.
+        # --- Temporal branch configuration ---
+        var = (variant or "").lower()
+        self.variant = var
+        self.has_time = ("doy" in var) or ("monthly" in var)
 
-        Parameters
-        ----------
-        coords : torch.Tensor
-            Tensor of shape ``[B, 2]`` containing latitude and longitude in degrees.
-        month : Optional[torch.Tensor], default=None
-            Tensor containing temporal indices.  When ``variant"doy"`` was
-            specified at construction, this argument is interpreted as the
-            day‑of‑year and must therefore lie in the range 1–365.  Otherwise
-            it is ignored.
+        # Encoded fusion mode from variant suffix.
+        if "had" in var:
+            self.time_fusion = "hadamard"
+        elif "cat" in var or "concat" in var:
+            self.time_fusion = "concat"
+        else:
+            self.time_fusion = "add"
 
-        Returns
-        -------
-        torch.Tensor
-            Encoded tensor of shape ``[B, emb_dim]``.
+        if self.has_time:
+            if temporal_sigma is None:
+                temporal_sigma_list = sigma_list
+            elif isinstance(temporal_sigma, (float, int)):
+                temporal_sigma_list = [float(temporal_sigma)]
+            else:
+                temporal_sigma_list = [float(s) for s in temporal_sigma]
+
+            # Temporal input is 2D (sin, cos) of the index.
+            self.temporal_blocks = nn.ModuleList(
+                [
+                    _RFFBlock(s, input_size=2, encoded_size=encoded_size, dim=dim)
+                    for s in temporal_sigma_list
+                ]
+            )
+        else:
+            self.temporal_blocks = None
+
+        # Fusion MLP for concat mode.
+        if self.has_time and self.time_fusion == "concat":
+            self.fusion_mlp = nn.Sequential(
+                nn.Linear(2 * dim, dim),
+                nn.ReLU(inplace=True),
+                nn.Linear(dim, dim),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.fusion_mlp = None
+
+        # Final projection to emb_dim and LayerNorm for stability.
+        self.head = nn.Linear(dim, emb_dim)
+        self.norm = nn.LayerNorm(emb_dim)
+
+    # -------------------------
+    # Internal helpers
+    # -------------------------
+
+    def _encode_spatial(self, coords: Tensor) -> Tensor:
         """
-        if coords is None:
-            raise ValueError("coords is required for RFFLocationEncoder")
+        coords : [B, 2] in degrees (lat, lon).
+        """
         if coords.dim() != 2 or coords.size(-1) != 2:
             raise ValueError(
-                f"coords must have shape [B, 2], got {tuple(coords.shape)}"
+                f"RFFLocationEncoder expects coords [B,2], got {tuple(coords.shape)}"
             )
-        # Reorder (lat, lon) to (lon, lat) for normalization and encode into [-1,1]
-        lonlat = torch.stack([coords[:, 1], coords[:, 0]], dim=1)
-        loc = self.pos(lonlat)
-        # Encode spatial features
-        spatial_feats = self.spatial_enc(loc)
-        features = [spatial_feats]
-        # Encode temporal features if requested
-        if self.use_temporal:
-            if time is None:
-                raise ValueError(
-                    "time (day-of-year) tensor must be provided when variant='doy'"
-                )
-            # Flatten and convert to float
-            t = time.float().squeeze(-1) if time.dim() > 1 else time.float()
-            # Normalize day of year to [0,1]; adding small epsilon to avoid zeros at exactly 0
-            t_norm = t / 365.2425
-            t_norm = t_norm.unsqueeze(-1)  # shape [B,1]
-            temporal_feats = self.temporal_enc(t_norm)
-            features.append(temporal_feats)
-        # Concatenate features and run through capsule and head
-        feat = torch.cat(features, dim=-1)
-        x = self.capsule(feat)
-        out = self.head(x)
-        return out
+
+        # Convert to radians and apply Equal Earth projection.
+        lat_rad = coords[:, 0] * math.pi / 180.0
+        lon_rad = coords[:, 1] * math.pi / 180.0
+        proj = equal_earth_projection(torch.stack((lat_rad, lon_rad), dim=-1))
+
+        feats = None
+        for block in self.spatial_blocks:
+            out = block(proj)
+            feats = out if feats is None else feats + out
+        return feats
+
+    def _encode_temporal(self, idx: Tensor) -> Tensor:
+        """
+        idx : [B] or [B,1]; interpreted as month (1..12) or DOY (1..365)
+        depending on the variant.
+        """
+        if not self.has_time or self.temporal_blocks is None:
+            raise RuntimeError(
+                "Temporal encoding requested but temporal branch is not configured."
+            )
+
+        if idx.dim() > 1:
+            idx = idx.squeeze(-1)
+        idx = idx.to(dtype=torch.float32)
+
+        if "monthly" in self.variant:
+            period = 12.0
+        else:  # default to DOY
+            period = 365.0
+
+        phi = 2.0 * math.pi * (idx / period)
+        t2d = torch.stack((torch.sin(phi), torch.cos(phi)), dim=-1)  # [B, 2]
+
+        feats = None
+        for block in self.temporal_blocks:
+            out = block(t2d)
+            feats = out if feats is None else feats + out
+        return feats
+
+    # -------------------------
+    # Public forward
+    # -------------------------
+
+    def forward(self, coords: Tensor, month_or_doy: Optional[Tensor] = None) -> Tensor:
+        """
+        coords      : [B, 2]  (lat, lon in degrees)
+        month_or_doy: [B] or [B,1]; used as:
+            - month (1..12) if \"monthly\" in variant
+            - day-of-year (1..365) if \"doy\" in variant
+        """
+        spatial = self._encode_spatial(coords)
+
+        if self.has_time and month_or_doy is not None:
+            temporal = self._encode_temporal(month_or_doy)
+
+            if self.time_fusion == "hadamard":
+                fused = spatial * temporal
+            elif self.time_fusion == "concat":
+                fused = self.fusion_mlp(
+                    torch.cat((spatial, temporal), dim=-1)
+                )  # type: ignore[arg-type]
+            else:  # "add"
+                fused = spatial + temporal
+        else:
+            fused = spatial
+
+        out = self.head(fused)
+        return self.norm(out)
