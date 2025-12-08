@@ -250,7 +250,15 @@ def make_dataset(cfg):
     return_coords = bool(loc_name and loc_name not in ('none', ''))
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
     # Return time index (month or day of year) whenever a variant is specified
-    return_month = return_coords and loc_variant in ('monthly', 'doy')
+    # Determine whether to return a temporal index (month or day‑of‑year) for
+    # location encoders.  Any variant containing "doy" or "month"/"monthly"
+    # should trigger a temporal index.  Note: ``loc_variant`` may be an
+    # arbitrary string (e.g., "doy-concat", "doy-hadamard").
+    return_month = False
+    if return_coords and loc_variant:
+        lv = str(loc_variant)
+        if ('doy' in lv) or ('month' in lv):
+            return_month = True
 
     data_cfg = cfg['data']
     # Optional z targets
@@ -567,7 +575,15 @@ def run(cfg_path: str, overrides=None):
     use_location = bool(loc_name and loc_name not in ('none', ''))
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
     # Return month/day-of-year when location is used and variant is specified
-    return_month = use_location and loc_variant in ('monthly', 'doy')
+    # Determine whether to return a temporal index for the model in training.
+    # The model should receive a temporal index whenever the location variant
+    # contains "doy" or "month"/"monthly".  This includes variants such as
+    # "doy-hadamard" or "monthly-concat".
+    return_month = False
+    if use_location and loc_variant:
+        lv2 = str(loc_variant)
+        if ('doy' in lv2) or ('month' in lv2):
+            return_month = True
     physical_head_hidden_dim = cfg['model'].get('physical_head_hidden_dim', cfg['model']['attention']['attn_dim'])
 
     # Build model with optional head dropout

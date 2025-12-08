@@ -240,9 +240,22 @@ class DailyTSDataset(Dataset):
         # Determine how to interpret temporal indices.  If ``time_variant`` is
         # 'doy', day-of-year indices (1-365/366) will be used; otherwise month
         # indices (1-12) are used.
-        self.time_variant = str(time_variant or 'monthly').lower()
-        self.use_month = self.time_variant == 'monthly'
-        self.use_doy = self.time_variant == 'doy'
+        # Interpret the requested temporal variant.  Any string containing
+        # ``"doy"`` (case insensitive) will enable day‑of‑year indices, while
+        # strings containing ``"month"`` or ``"monthly"`` enable month
+        # indices.  Otherwise, default to months.
+        tv = str(time_variant or 'monthly').lower()
+        self.time_variant = tv
+        if 'doy' in tv:
+            self.use_doy = True
+            self.use_month = False
+        elif 'month' in tv:
+            self.use_month = True
+            self.use_doy = False
+        else:
+            # default to month if unspecified
+            self.use_month = True
+            self.use_doy = False
         self.z_feature_indices = list(z_feature_indices or [])
         self.return_z = len(self.z_feature_indices) > 0
 
@@ -514,7 +527,9 @@ def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> 
     # provided, fall back to the module-level default set by
     # ``DailyTSDataset.__init__``.
     variant = str(time_variant or _DEFAULT_TIME_VARIANT or 'monthly').lower()
-    if variant == 'doy':
+    # Interpret any variant containing "doy" as a day‑of‑year selection; otherwise
+    # default to months.  This accommodates variants like "doy-hadamard".
+    if 'doy' in variant:
         time_full = doys_full
     else:
         time_full = months_full

@@ -21,7 +21,7 @@ data:
   scaler_type: minmax # minmax | robust
   scaler_range: [-1.0, 1.0]
   save_scalers_to: experiments/ckpt/scalers
-  num_workers: 10
+  num_workers: 16
   prefetch_files: 4
   # indices (in *raw* feature order) for lat/lon — used only to build spatial folds
   lat_feature_index: 5
@@ -48,8 +48,8 @@ model:
   # ``proj_dim`` is provided and differs from ``emb_dim``, the location
   # embeddings will be projected to this dimensionality prior to fusion.
   location:
-    name: geoclip            # climplicit | geoclip | satclip | siren | resiren |none
-    variant: annual      # monthly | annual (only for climplicit)
+    name: geoclip-time            # climplicit | geoclip | satclip | siren | resiren |none
+    variant: doy-had      # monthly | annual (only for climplicit)
     emb_dim: 512          # raw embedding dimension of the location encoder
     pretrained: false       # whether to load pretrained weights if available
     freeze: false           # whether to freeze the location encoder during training
@@ -102,11 +102,11 @@ train:
   # Base weight for the physical loss.  This is the multiplicative factor for
   # the physical simulation loss when computing the overall objective.  A small
   # value (e.g. 0.1) encourages the model to prioritise the supervised task.
-  loss_weight_physical: 0.1
+  loss_weight_physical: 0.2
   # Ratio of random NCAR samples drawn per batch relative to batch size.  A
   # value of 0 disables augmentation; 0.5 would draw roughly half as many
   # random samples as supervised samples.
-  ncar_random_ratio: 0.0
+  ncar_random_ratio: 8.0
   # Dynamic weighting for the physical loss.  When enabled, the loss weight for
   # the physical head is updated each epoch based on recent prediction and
   # physical losses using a Dynamic Weighted Average (DWA) mechanism.  ``temperature``
@@ -114,9 +114,9 @@ train:
   # optional upper bound on the weight to prevent runaway growth; set to null
   # for no cap.
   loss_weight_physical_dynamic:
-    enabled: true
-    temperature: 2.0
-    cap: null
+    enabled: false
+    temperature: 3.0
+    cap: 0.35
 
 logging:
   tensorboard: true

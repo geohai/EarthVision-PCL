@@ -21,7 +21,7 @@ import torch.nn as nn
 
 from .bilstm_attn import LuongAttention
 from .siren import DirectSirenEncoder
-from .rff_encoder import RFFLocationEncoder
+from .rff_encoder import GeoCLIPTimeEncoder
 
 _LOG = logging.getLogger(__name__)
 
@@ -116,17 +116,33 @@ class LocationEncoderWrapper(nn.Module):
                         variant=var,
                     )
                     encoder_loaded = True
-                elif lname == 'rff':
-                    # Local RFF encoder with optional day‑of‑year branch
-                    var = str(self.variant).lower() if self.variant is not None else None
-                    # Use similar hidden dimension as SIREN for consistency
-                    hidden_dim = max(emb_dim, 512)
-                    self.encoder = RFFLocationEncoder(
+                elif lname in ('geoclip-time', 'geoclip_time'):
+                    from rshf.geoclip import GeoCLIP, GeoCLIPConfig  # type: ignore
+                    model_name = "MVRL/geoclip-location-encoder"
+                    if pretrained:
+                        base = GeoCLIP.from_pretrained(model_name)
+                    else:
+                        base = GeoCLIP(GeoCLIPConfig(sigma=[2, 2 ** 2], input_size=2,
+                                                     encoded_size=256, dim=512))
+                    if freeze:
+                        for p in base.parameters():
+                            p.requires_grad = False
+
+                    v = (variant or "").lower()
+                    if "had" in v:
+                        fusion_mode = "hadamard"
+                    elif "cat" in v:
+                        fusion_mode = "concat"
+                    else:
+                        fusion_mode = "add"
+                    self.encoder = GeoCLIPTimeEncoder(
+                        base_encoder=base,
                         emb_dim=emb_dim,
-                        sigma=(2.0, 4.0),
-                        encoded_size=256,
-                        dim=hidden_dim,
-                        variant=var,
+                        time_variant=v or "doy",
+                        fusion_mode=fusion_mode,
+                        temporal_sigma=[1.0, 2.0],
+                        temporal_encoded_size=128,
+                        temporal_hidden_dim=256,
                     )
                     encoder_loaded = True
             except ImportError:
@@ -211,8 +227,10 @@ class LocationEncoderWrapper(nn.Module):
             # SatCLIP expects [lon, lat]
             xy = torch.stack([coords[:, 1], coords[:, 0]], dim=1)
             out = self.encoder(xy)
-        elif lname in ('siren', 'resiren', 'rff'):
+        elif lname in ('siren', 'resiren'):
             # For local encoders we delegate handling of the temporal index
+            out = self.encoder(coords, month)
+        elif lname in ('geoclip-time', 'geoclip_time'):
             out = self.encoder(coords, month)
         else:
             # Fallback MLP: concatenate coords and (optionally) temporal index
