@@ -141,7 +141,7 @@ class LocationEncoderWrapper(nn.Module):
                         time_variant=v or "doy",
                         fusion_mode=fusion_mode,
                         temporal_sigma=[1.0, 2.0],
-                        temporal_encoded_size=128,
+                        temporal_encoded_size=64,
                         temporal_hidden_dim=256,
                     )
                     encoder_loaded = True
