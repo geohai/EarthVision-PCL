@@ -60,13 +60,19 @@ model:
 
 # NEW: explicit split section
 split:
-  name: spatial             # random | spatial
+  name: checkerboard-deg             # random | spatial | checkerboard-deg
   seed: 42                 # ensures reproducible splits
   test_split: 0.10         # fraction for *test* holdout (kept fixed across runs)
   val_split: 0.10          # fraction for *validation* (from remaining train pool)
   spatial:
     n_splits: 10           # used when name=spatial
     fold_index: 0          # which fold is test (0..n_splits-1)
+  checkerboard:
+    scale: conus           # conus or global
+    deg: 8.0               # cell size in degrees
+    n_splits: 2            # number of folds in the checkerboard
+    fold_index: 0          # which fold is used as test (0..n_splits-1)
+    visualize: true        # optinal: for grid visualization downstream
 
 train:
   device: cuda
@@ -102,11 +108,11 @@ train:
   # Base weight for the physical loss.  This is the multiplicative factor for
   # the physical simulation loss when computing the overall objective.  A small
   # value (e.g. 0.1) encourages the model to prioritise the supervised task.
-  loss_weight_physical: 0.2
+  loss_weight_physical: 0.20
   # Ratio of random NCAR samples drawn per batch relative to batch size.  A
   # value of 0 disables augmentation; 0.5 would draw roughly half as many
   # random samples as supervised samples.
-  ncar_random_ratio: 8.0
+  ncar_random_ratio: 0.0
   # Dynamic weighting for the physical loss.  When enabled, the loss weight for
   # the physical head is updated each epoch based on recent prediction and
   # physical losses using a Dynamic Weighted Average (DWA) mechanism.  ``temperature``

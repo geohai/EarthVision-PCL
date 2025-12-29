@@ -38,7 +38,7 @@ from .data.daily_dataset import DailyTSDataset, load_ncar_grid as _load_ncar_gri
 from .models.bilstm_attn import BiLSTMAttnRegressor
 from .models.bilstm_attn_fusion import BiLSTMAttnLocRegressor
 from .utils.export import save_predictions_and_metrics
-from .utils.splits import random_holdout_indices, spatial_fold_indices
+from .utils.splits import random_holdout_indices, spatial_fold_indices, checkerboard_deg_fold_indices
 
 
 _PAT = re.compile(r"\$\{([^}]+)\}")
@@ -307,22 +307,52 @@ def make_splits(cfg, ds):
     test_frac = float(split['test_split'])
     val_frac = float(split['val_split'])
 
-    if name == 'random':
+    # 1) build train_pool / test_idx
+    if name == "random":
+        n = len(ds)
+        test_frac = float(split["test_split"])
         train_pool, test_idx = random_holdout_indices(n, test_frac, seed)
-    elif name == 'spatial':
-        train_pool, test_idx = spatial_fold_indices(ds.coords, split['spatial']['n_splits'], split['spatial']['fold_index'], seed)
+
+    elif name == "spatial":
+        sp = split["spatial"]
+        train_pool, test_idx = spatial_fold_indices(
+            ds.coords,
+            int(sp["n_splits"]),
+            int(sp["fold_index"]),
+            seed,
+        )
+
+    elif name in ("checkerboard", "checkerboard-deg", "checkerboard_deg"):
+        cb = split.get("checkerboard", {})
+        grid_deg = float(cb.get("deg", cb.get("grid_deg", 8.0)))
+        n_splits = int(cb.get("n_splits", 4))
+        fold_index = int(cb.get("fold_index", 0))
+        scale = str(cb.get("scale", "global")).lower()
+
+        coords = getattr(ds, "coords", None)
+        if coords is None:
+            raise RuntimeError("Checkerboard split requires ds.coords (lat/lon).")
+
+        train_pool, test_idx = checkerboard_deg_fold_indices(
+            coords, grid_deg, n_splits, fold_index, scale
+        )
+
     else:
-        raise ValueError(f"Unknown split.name: {name}")
+        raise ValueError(f"Unknown split.name: {split['name']}")
+
+    # 2) optional val split (always random from train_pool)
+    train_pool = np.asarray(train_pool)
+    test_idx = np.asarray(test_idx)
 
     if val_frac > 0:
-        tr_idx, val_idx = random_holdout_indices(len(train_pool), val_frac, seed + 1)
-        train_idx = np.asarray(train_pool)[tr_idx]
-        val_idx = np.asarray(train_pool)[val_idx]
+        tr_rel, val_rel = random_holdout_indices(len(train_pool), val_frac, seed + 1)
+        train_idx = train_pool[tr_rel]
+        val_idx = train_pool[val_rel]
     else:
-        train_idx = np.asarray(train_pool)
+        train_idx = train_pool
         val_idx = np.array([], dtype=int)
 
-    return train_idx, val_idx, np.asarray(test_idx)
+    return train_idx, val_idx, test_idx
 
 
 def make_loaders(cfg, ds, train_idx, val_idx, device):
