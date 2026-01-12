@@ -39,6 +39,7 @@ from .models.bilstm_attn import BiLSTMAttnRegressor
 from .models.bilstm_attn_fusion import BiLSTMAttnLocRegressor
 from .utils.export import save_predictions_and_metrics
 from .utils.splits import random_holdout_indices, spatial_fold_indices, checkerboard_deg_fold_indices
+from .utils.visualize import visualize_checkerboard_split
 
 
 _PAT = re.compile(r"\$\{([^}]+)\}")
@@ -591,6 +592,43 @@ def run(cfg_path: str, overrides=None):
 
     train_idx, val_idx, test_idx = make_splits(cfg, ds)
     train_loader, val_loader, input_size = make_loaders(cfg, ds, train_idx, val_idx, device)
+
+    # Compute counts
+    train_count = len(train_idx)
+    val_count = len(val_idx)
+    test_count = len(test_idx)
+    total = train_count + test_count
+
+    # Calculate ratios
+    train_test_ratio = train_count / total if total else float('nan')
+
+    # Log the information
+    log.info(
+        f"Split sizes – train: {train_count}, val: {val_count}, test: {test_count}"
+    )
+    log.info(
+        f"Train/test ratio: {train_count}/{test_count} = {train_test_ratio:.3f}"
+    )
+
+    # If we want to visualize the checkerboard split
+    if cfg["split"]["name"].lower() in ("checkerboard", "checkerboard-deg", "checkerboard_deg"):
+        cb_cfg = cfg["split"].get("checkerboard", {})
+        if cb_cfg.get("visualize", False):
+            grid_deg = float(cb_cfg.get("deg", cb_cfg.get("grid_deg", 8.0)))
+            n_splits = int(cb_cfg.get("n_splits", 4))
+            scale = str(cb_cfg.get("scale", "conus"))
+            fold_index = int(cb_cfg.get("fold_index", 0))
+            # Use dataset coordinates (lat, lon) directly
+            coords = ds.coords  # shape (N, 2)
+            run_dir = run_results_dir  # or wherever you want to save the figure
+            visualize_checkerboard_split(
+                coords=coords,
+                grid_deg=grid_deg,
+                n_splits=n_splits,
+                scale=scale,
+                run_dir=run_dir,
+                fold_index=fold_index,
+            )
 
     # Physical config
     data_cfg = cfg.get('data', {})
