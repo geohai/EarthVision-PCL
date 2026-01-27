@@ -1,14 +1,19 @@
-"""Training script for LOC4PM with optional location encoders and NCAR augmentation.
+"""Training script for LOC4PM with support for auxiliary physical variables.
 
 This script orchestrates the training of BiLSTM‑based pollution models with
-optional attention, location fusion, and physical simulation heads.  In
-addition to the original observation targets, it supports augmenting the
-training batches with randomly sampled NCAR reanalysis points to better
-exploit the gapless simulation data.  The number of random NCAR points
-sampled per batch is controlled via ``train.ncar_random_ratio`` in the
-configuration.  When enabled, the physical loss is normalized by the
-combined number of NCAR and observation samples to balance the
-contributions from supervised and unsupervised data.
+optional attention, location fusion, and both primary and auxiliary physical
+simulation heads.  In addition to the original observation targets, it
+supports augmenting the training batches with randomly sampled NCAR reanalysis
+points to better exploit the gapless simulation data.  The number of random
+NCAR points sampled per batch is controlled via ``train.ncar_random_ratio``
+in the configuration.  When enabled, the physical loss is normalized by the
+combined number of NCAR and observation samples to balance the contributions
+from supervised and unsupervised data.  When auxiliary physical targets are
+enabled (via ``data.z_aux_feature_indices``), the model predicts both the
+primary physical variables (e.g. PM2.5) and the auxiliary variables
+(e.g. air density, relative humidity).  The training and evaluation loops
+compute physical losses for both heads and average them to form the
+regularization term.
 """
 
 from __future__ import annotations
@@ -41,7 +46,6 @@ from .utils.export import save_predictions_and_metrics
 from .utils.splits import random_holdout_indices, spatial_fold_indices, checkerboard_deg_fold_indices
 from .utils.visualize import visualize_checkerboard_split
 
-
 _PAT = re.compile(r"\$\{([^}]+)\}")
 
 # -----------------------------------------------------------------------------
@@ -65,11 +69,11 @@ _NCAR_MONTH: Optional[np.ndarray] = None
 def _load_ncar_grid(ncar_path: str) -> None:
     """Load NCAR parquet files and prepare arrays for random sampling.
 
-    This function populates module‑level arrays used by
-    ``_sample_ncar_points``.  It expects parquet files with columns
-    ``['lat_nw','lon_nw','lat_ne','lon_ne','lat_se','lon_se','lat_sw','lon_sw',
-    'PM25_TOT','date']``.  The month index is extracted from the ``date``
-    column (assumed to be parseable via ``pandas.to_datetime``).
+    This function populates module‑level arrays used by ``_sample_ncar_points``.
+    It expects parquet files with columns ``['lat_nw','lon_nw','lat_ne','lon_ne',
+    'lat_se','lon_se','lat_sw','lon_sw','PM25_TOT','date']``.  The month
+    index is extracted from the ``date`` column (assumed to be parseable via
+    ``pandas.to_datetime``).
 
     Parameters
     ----------
@@ -78,9 +82,7 @@ def _load_ncar_grid(ncar_path: str) -> None:
         matching ``*.parquet`` will be loaded.
     """
     global _NCAR_DF, _NCAR_LAT_MIN, _NCAR_LAT_MAX, _NCAR_LON_MIN, _NCAR_LON_MAX, _NCAR_Z, _NCAR_MONTH
-
     if _NCAR_DF is not None:
-        # Already loaded
         return
     files = sorted(glob.glob(os.path.join(ncar_path, "*.parquet")))
     dfs: list[pd.DataFrame] = []
@@ -92,7 +94,6 @@ def _load_ncar_grid(ncar_path: str) -> None:
             continue
         if df.empty:
             continue
-        # Ensure required columns exist
         required = {
             'lat_nw', 'lon_nw', 'lat_ne', 'lon_ne', 'lat_se', 'lon_se', 'lat_sw', 'lon_sw',
             'PM25_TOT', 'date'
@@ -106,7 +107,6 @@ def _load_ncar_grid(ncar_path: str) -> None:
         logging.warning("No NCAR parquet files loaded from %s", ncar_path)
         return
     _NCAR_DF = pd.concat(dfs, ignore_index=True)
-    # Compute bounding boxes and physical targets
     corners_lat = _NCAR_DF[['lat_nw', 'lat_ne', 'lat_se', 'lat_sw']].to_numpy(dtype=float)
     corners_lon = _NCAR_DF[['lon_nw', 'lon_ne', 'lon_se', 'lon_sw']].to_numpy(dtype=float)
     _NCAR_LAT_MIN = corners_lat.min(axis=1)
@@ -117,7 +117,6 @@ def _load_ncar_grid(ncar_path: str) -> None:
     try:
         _NCAR_MONTH = pd.to_datetime(_NCAR_DF['date']).dt.month.to_numpy(dtype=int)
     except Exception:
-        # Fallback: parse month from the parquet filename or default to 1
         _NCAR_MONTH = np.ones(len(_NCAR_DF), dtype=int)
 
 
@@ -138,13 +137,11 @@ def _sample_ncar_points(num_samples: int) -> tuple[np.ndarray, np.ndarray, np.nd
     """
     if num_samples <= 0 or _NCAR_LAT_MIN is None:
         return np.zeros((0, 2), dtype=float), np.zeros((0,), dtype=int), np.zeros((0,), dtype=float)
-    # Randomly select rows from the NCAR data
     idxs = np.random.randint(0, len(_NCAR_LAT_MIN), size=num_samples)
     lat_min = _NCAR_LAT_MIN[idxs]
     lat_max = _NCAR_LAT_MAX[idxs]
     lon_min = _NCAR_LON_MIN[idxs]
     lon_max = _NCAR_LON_MAX[idxs]
-    # Uniformly sample within the bounding box
     lats = lat_min + np.random.rand(num_samples) * (lat_max - lat_min)
     lons = lon_min + np.random.rand(num_samples) * (lon_max - lon_min)
     z_vals = _NCAR_Z[idxs]
@@ -173,9 +170,35 @@ def _expand_all_strings(obj, cfg):
             try:
                 return str(_deep_get(cfg, key))
             except Exception:
-                return m.group(0)  # leave as‑is if missing
+                return m.group(0)
         return _PAT.sub(repl, obj)
     return obj
+
+
+def _expand_placeholders(s: str, cfg: dict) -> str:
+    if not isinstance(s, str):
+        return s
+    pat = re.compile(r"\$\{([^}]+)\}")
+    def repl(m):
+        key = m.group(1)
+        try:
+            return str(_deep_get(cfg, key))
+        except Exception:
+            return m.group(0)
+    return pat.sub(repl, s)
+
+
+def _expand_cfg_strings(cfg: dict) -> None:
+    if 'logging' in cfg and 'run_name' in cfg['logging']:
+        cfg['logging']['run_name'] = _expand_placeholders(cfg['logging']['run_name'], cfg)
+    if 'logging' in cfg:
+        for k in ('epoch_csv', 'step_csv'):
+            if k in cfg['logging']:
+                cfg['logging'][k] = _expand_placeholders(cfg['logging'][k], cfg)
+    if 'eval' in cfg:
+        for k in ('out_csv_val', 'out_csv_test'):
+            if k in cfg['eval']:
+                cfg['eval'][k] = _expand_placeholders(cfg['eval'][k], cfg)
 
 
 def _expand_placeholders(s: str, cfg: dict) -> str:
@@ -245,16 +268,19 @@ def _apply_overrides(cfg, updates):
 # -------------------------- data + scheduler ------------------------------ #
 
 def make_dataset(cfg):
-    """Instantiate DailyTSDataset and persist scalers."""
+    """Instantiate DailyTSDataset and persist scalers.
+
+    This function constructs the dataset using configuration parameters.  It
+    supports optional primary and auxiliary physical variables by passing
+    corresponding feature indices, names, and statistics into
+    ``DailyTSDataset``.  After instantiation, the fitted feature and target
+    scalers are saved to disk for later use.
+    """
     loc_cfg = cfg.get('model', {}).get('location', {}) or {}
     loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
     return_coords = bool(loc_name and loc_name not in ('none', ''))
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
     # Return time index (month or day of year) whenever a variant is specified
-    # Determine whether to return a temporal index (month or day‑of‑year) for
-    # location encoders.  Any variant containing "doy" or "month"/"monthly"
-    # should trigger a temporal index.  Note: ``loc_variant`` may be an
-    # arbitrary string (e.g., "doy-concat", "doy-hadamard").
     return_month = False
     if return_coords and loc_variant:
         lv = str(loc_variant)
@@ -262,8 +288,12 @@ def make_dataset(cfg):
             return_month = True
 
     data_cfg = cfg['data']
-    # Optional z targets
-    z_feature_indices = data_cfg.get('z_feature_indices', [])
+    # Primary and auxiliary z targets
+    z_feature_indices = data_cfg.get('z_feature_indices', []) or []
+    z_aux_feature_indices = data_cfg.get('z_aux_feature_indices', []) or []
+    z_feature_names = data_cfg.get('z_feature_names', None)
+    z_aux_feature_names = data_cfg.get('z_aux_feature_names', None)
+    z_stats = data_cfg.get('z_stats', None)
     z_scaler_range = tuple(data_cfg.get('z_scaler_range', data_cfg.get('scaler_range', (-1.0, 1.0))))
     ncar_path = data_cfg.get('ncar_grid_path', None)
 
@@ -282,19 +312,22 @@ def make_dataset(cfg):
         lon_feature_index=data_cfg.get('lon_feature_index', None),
         return_coords=return_coords,
         return_month=return_month,
-        # NEW for physical head
+        time_variant=loc_variant,
+        # Primary physical variables
         z_feature_indices=z_feature_indices,
+        z_aux_feature_indices=z_aux_feature_indices,
+        z_feature_names=z_feature_names,
+        z_aux_feature_names=z_aux_feature_names,
+        z_stats=z_stats,
         z_scaler_range=z_scaler_range,
-        # NEW: allow choosing target scaler type (minmax or robust)
         scaler_type=data_cfg.get('scaler_type', 'minmax'),
         ncar_path=ncar_path,
-        # NEW: propagate variant to dataset for temporal encoding
-        time_variant=loc_variant,
     )
 
     os.makedirs(data_cfg['save_scalers_to'], exist_ok=True)
     joblib.dump(ds.x_scaler, os.path.join(data_cfg['save_scalers_to'], 'X_scaler.joblib'))
     joblib.dump(ds.y_scaler, os.path.join(data_cfg['save_scalers_to'], 'y_scaler.joblib'))
+    # Persist primary z scaler if available (may be None when using stats)
     if getattr(ds, 'return_z', False) and getattr(ds, 'z_scaler', None) is not None:
         joblib.dump(ds.z_scaler, os.path.join(data_cfg['save_scalers_to'], 'z_scaler.joblib'))
     return ds
@@ -329,22 +362,18 @@ def make_splits(cfg, ds):
         n_splits = int(cb.get("n_splits", 4))
         fold_index = int(cb.get("fold_index", 0))
         scale = str(cb.get("scale", "global")).lower()
-
         coords = getattr(ds, "coords", None)
         if coords is None:
             raise RuntimeError("Checkerboard split requires ds.coords (lat/lon).")
-
         train_pool, test_idx = checkerboard_deg_fold_indices(
             coords, grid_deg, n_splits, fold_index, scale
         )
-
     else:
         raise ValueError(f"Unknown split.name: {split['name']}")
 
     # 2) optional val split (always random from train_pool)
     train_pool = np.asarray(train_pool)
     test_idx = np.asarray(test_idx)
-
     if val_frac > 0:
         tr_rel, val_rel = random_holdout_indices(len(train_pool), val_frac, seed + 1)
         train_idx = train_pool[tr_rel]
@@ -352,7 +381,6 @@ def make_splits(cfg, ds):
     else:
         train_idx = train_pool
         val_idx = np.array([], dtype=int)
-
     return train_idx, val_idx, test_idx
 
 
@@ -365,7 +393,6 @@ def make_loaders(cfg, ds, train_idx, val_idx, device):
         val_loader = DataLoader(val_set, batch_size=cfg['train']['batch_size'], shuffle=False, num_workers=num_workers, pin_memory=(device.type == 'cuda'), drop_last=False)
     else:
         val_loader = None
-
     first_batch = next(iter(train_loader))
     x0 = first_batch[0] if isinstance(first_batch, (list, tuple)) else first_batch
     input_size = x0.shape[-1]
@@ -394,31 +421,49 @@ def make_scheduler(opt, cfg):
 # -------------------------- batch / output utils -------------------------- #
 
 def _split_model_outputs(out):
-    # Accept (yhat, attn) or (yhat, zhat, attn)
+    """Unpack model outputs into (yhat, zhat, zhat_aux, attn).
+
+    The model may return different combinations of outputs depending on whether
+    physical heads are enabled.  This helper normalizes the output into a
+    four‑tuple where missing values are set to ``None``.
+    """
+    yhat = zhat = zhat_aux = attn = None
     if isinstance(out, (list, tuple)):
-        if len(out) == 3:
+        if len(out) == 4:
+            yhat, zhat, zhat_aux, attn = out
+        elif len(out) == 3:
+            # original behaviour: (yhat, zhat, attn) – no aux head
             yhat, zhat, attn = out
         elif len(out) == 2:
+            # (yhat, attn) only
             yhat, attn = out
-            zhat = None
-        else:
-            yhat, zhat, attn = out, None, None
+        elif len(out) == 1:
+            yhat = out[0]
     else:
-        yhat, zhat, attn = out, None, None
-    return yhat, zhat, attn
+        yhat = out
+    return yhat, zhat, zhat_aux, attn
 
 
-def _parse_batch(batch, use_location: bool, return_month: bool, expect_z: bool):
+def _parse_batch(batch, use_location: bool, return_month: bool, expect_z: bool, expect_z_aux: bool):
     """
-    Supports tuples: (x, y), (x,z,y), (x,coords,y), (x,coords,z,y),
-                     (x,coords,month,y), (x,coords,month,z,y)
+    Parse a data loader batch into its components.
+
+    Supports tuples: (x, y), (x,z,y), (x,z,zaux,y), (x,coords,y), (x,coords,z,y),
+    (x,coords,z,zaux,y), (x,coords,month,y), (x,coords,month,z,y),
+    (x,coords,month,z,zaux,y).
     """
     if not isinstance(batch, (list, tuple)):
         raise RuntimeError("Unexpected batch format")
     x = batch[0]
-    coords = month_t = z = y = None
+    coords = month_t = z = z_aux = y = None
+    # Determine expected length based on flags
     if not use_location:
-        if expect_z:
+        # Format: (x,[z],[z_aux], y)
+        if expect_z and expect_z_aux:
+            if len(batch) != 4:
+                raise RuntimeError(f"Expected (x,z,z_aux,y), got len={len(batch)}")
+            _, z, z_aux, y = batch
+        elif expect_z:
             if len(batch) != 3:
                 raise RuntimeError(f"Expected (x,z,y), got len={len(batch)}")
             _, z, y = batch
@@ -427,8 +472,14 @@ def _parse_batch(batch, use_location: bool, return_month: bool, expect_z: bool):
                 raise RuntimeError(f"Expected (x,y), got len={len(batch)}")
             _, y = batch
     else:
+        # Coordinates are returned
         if return_month:
-            if expect_z:
+            # Format: (x,coords,month,[z],[z_aux],y)
+            if expect_z and expect_z_aux:
+                if len(batch) != 6:
+                    raise RuntimeError(f"Expected (x,coords,month,z,z_aux,y), got len={len(batch)}")
+                x, coords, month_t, z, z_aux, y = batch
+            elif expect_z:
                 if len(batch) != 5:
                     raise RuntimeError(f"Expected (x,coords,month,z,y), got len={len(batch)}")
                 x, coords, month_t, z, y = batch
@@ -437,7 +488,12 @@ def _parse_batch(batch, use_location: bool, return_month: bool, expect_z: bool):
                     raise RuntimeError(f"Expected (x,coords,month,y), got len={len(batch)}")
                 x, coords, month_t, y = batch
         else:
-            if expect_z:
+            # Format: (x,coords,[z],[z_aux],y)
+            if expect_z and expect_z_aux:
+                if len(batch) != 5:
+                    raise RuntimeError(f"Expected (x,coords,z,z_aux,y), got len={len(batch)}")
+                x, coords, z, z_aux, y = batch
+            elif expect_z:
                 if len(batch) != 4:
                     raise RuntimeError(f"Expected (x,coords,z,y), got len={len(batch)}")
                 x, coords, z, y = batch
@@ -445,7 +501,7 @@ def _parse_batch(batch, use_location: bool, return_month: bool, expect_z: bool):
                 if len(batch) != 3:
                     raise RuntimeError(f"Expected (x,coords,y), got len={len(batch)}")
                 x, coords, y = batch
-    return x, coords, month_t, z, y
+    return x, coords, month_t, z, z_aux, y
 
 
 def _count_params(model):
@@ -455,7 +511,6 @@ def _count_params(model):
 
 
 def _count_params_by_top(model):
-    # aggregate by top‑level module name from named_parameters()
     buckets = {}
     for name, p in model.named_parameters():
         top = name.split('.', 1)[0]
@@ -479,38 +534,48 @@ def evaluate(
     use_location: bool = False,
     return_month: bool = False,
     return_z: bool = False,
+    return_z_aux: bool = False,
     loss_weight_physical: float = 0.0,
 ):
-    """Evaluate with component losses: returns (mean_total, mean_pred, mean_phys, y_pred, y_true)."""
+    """Evaluate with component losses: returns (mean_total, mean_pred, mean_phys, y_pred, y_true).
+
+    When both primary and auxiliary physical heads are enabled, the physical loss
+    is computed for each head and averaged before being multiplied by the
+    loss weight.  The returned ``mean_phys`` is the mean of the unweighted
+    physical losses across all batches.
+    """
     model.eval()
     tot_losses, pred_losses, phys_losses = [], [], []
     y_pred_list, y_true_list = [], []
     with torch.no_grad():
         for batch in loader:
-            x, coords, month_t, z, y = _parse_batch(batch, use_location, return_month, expect_z=return_z)
+            x, coords, month_t, z, z_aux, y = _parse_batch(batch, use_location, return_month, expect_z=return_z, expect_z_aux=return_z_aux)
             x = x.to(device)
             y = y.to(device).squeeze(-1)
             coords = coords.to(device) if coords is not None else None
             month_t = month_t.to(device) if month_t is not None else None
-            z = z.to(device).squeeze(-1) if z is not None else None
-
+            z = z.to(device) if z is not None else None
+            z_aux = z_aux.to(device) if z_aux is not None else None
             out = model(x, coords, month_t) if use_location else model(x)
-            yhat, zhat, _ = _split_model_outputs(out)
-
+            yhat, zhat, zhat_aux, _ = _split_model_outputs(out)
             pred_loss = loss_fn(yhat, y)
             phys_loss = torch.tensor(0.0, device=device)
-            if return_z and (zhat is not None):
-                zpred = zhat.squeeze(-1)
-                phys_loss = loss_fn(zpred, z)
-
+            if return_z and zhat is not None and z is not None:
+                # primary physical loss
+                loss_main = loss_fn(zhat, z)
+                if return_z_aux and zhat_aux is not None and z_aux is not None:
+                    # auxiliary physical loss
+                    loss_aux = loss_fn(zhat_aux, z_aux)
+                    phys_loss = (loss_main + loss_aux) / 2.0
+                else:
+                    phys_loss = loss_main
+            # combine losses
             loss = pred_loss + loss_weight_physical * phys_loss
-
             tot_losses.append(loss.item())
             pred_losses.append(pred_loss.item())
             phys_losses.append(float(phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss))
             y_pred_list.append(yhat.detach().cpu().numpy())
             y_true_list.append(y.detach().cpu().numpy())
-
     mean_total = float(np.mean(tot_losses)) if tot_losses else float('nan')
     mean_pred = float(np.mean(pred_losses)) if pred_losses else float('nan')
     mean_phys = float(np.mean(phys_losses)) if phys_losses else 0.0
@@ -522,13 +587,10 @@ def evaluate(
 def run(cfg_path: str, overrides=None):
     with open(cfg_path, 'r') as f:
         cfg = yaml.safe_load(f)
-
     if overrides:
         _apply_overrides(cfg, _parse_overrides(overrides))
-
     cfg = _expand_all_strings(cfg, cfg)
     _expand_cfg_strings(cfg)
-
     # From‑scratch override to ensure location backbones aren't pretrained/frozen.
     from_scratch = bool(cfg.get('train', {}).get('from_scratch', False))
     if from_scratch:
@@ -539,14 +601,12 @@ def run(cfg_path: str, overrides=None):
             loc_section['freeze'] = False
         cfg.setdefault('model', {}).setdefault('location', {})
         cfg['model']['location'].update(loc_section)
-
     # Run ID / dirs
     job_id = os.getenv("SLURM_JOB_ID", "local")
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     keyparts = {k: cfg[k] for k in ('model', 'train', 'data', 'split') if k in cfg}
     h = hashlib.md5(json.dumps(keyparts, sort_keys=True, default=str).encode()).hexdigest()[:8]
     run_id = f"{cfg['project']['name']}_{cfg['data']['start_date']}_{cfg['data']['end_date']}_{cfg['split']['name']}_{ts}_j{job_id}_{h}"
-
     base_results = cfg['project']['results_dir']
     base_logs = cfg['project']['log_dir']
     base_ckpt = cfg['project']['ckpt_dir']
@@ -554,15 +614,12 @@ def run(cfg_path: str, overrides=None):
     run_logs_dir = os.path.join(base_logs, run_id)
     run_tb_dir = os.path.join(run_logs_dir, "tb")
     run_ckpt_dir = os.path.join(base_ckpt, run_id)
-
     cfg['eval']['out_csv_val'] = os.path.join(run_results_dir, "val.csv")
     cfg['eval']['out_csv_test'] = os.path.join(run_results_dir, "test.csv")
-
     os.makedirs(run_results_dir, exist_ok=True)
     os.makedirs(run_logs_dir, exist_ok=True)
     os.makedirs(run_tb_dir, exist_ok=True)
     os.makedirs(run_ckpt_dir, exist_ok=True)
-
     # Logging
     log_path = os.path.join(run_logs_dir, "run.log")
     logging.basicConfig(
@@ -574,43 +631,36 @@ def run(cfg_path: str, overrides=None):
     log.info("Run ID: %s", run_id)
     log.info("Job ID: %s", job_id)
     log.info("Saving results to: %s", run_results_dir)
-
     # Snapshot cfg
     with open(os.path.join(run_results_dir, "config.resolved.yaml"), "w") as f:
         yaml.safe_dump(cfg, f, sort_keys=False)
     if overrides:
         with open(os.path.join(run_results_dir, "overrides.json"), "w") as f:
             json.dump(_parse_overrides(overrides), f, indent=2)
-
     # Device
     req_dev = str(cfg['train']['device']).lower()
     device = torch.device('cuda' if (req_dev == 'cuda' and torch.cuda.is_available()) else 'cpu')
-
     # Data + splits + loaders
     ds = make_dataset(cfg)
-    z_scaler = ds.z_scaler
-
+    # Grab scalers and stats for z (primary) from dataset
+    z_scaler = getattr(ds, 'z_scaler', None)
+    z_mean = getattr(ds, 'z_mean', None)
+    z_std = getattr(ds, 'z_std', None)
     train_idx, val_idx, test_idx = make_splits(cfg, ds)
     train_loader, val_loader, input_size = make_loaders(cfg, ds, train_idx, val_idx, device)
-
     # Compute counts
     train_count = len(train_idx)
     val_count = len(val_idx)
     test_count = len(test_idx)
     total = train_count + test_count
-
-    # Calculate ratios
     train_test_ratio = train_count / total if total else float('nan')
-
-    # Log the information
     log.info(
         f"Split sizes – train: {train_count}, val: {val_count}, test: {test_count}"
     )
     log.info(
         f"Train/test ratio: {train_count}/{test_count} = {train_test_ratio:.3f}"
     )
-
-    # If we want to visualize the checkerboard split
+    # Visualize checkerboard if requested
     if cfg["split"]["name"].lower() in ("checkerboard", "checkerboard-deg", "checkerboard_deg"):
         cb_cfg = cfg["split"].get("checkerboard", {})
         if cb_cfg.get("visualize", False):
@@ -618,43 +668,36 @@ def run(cfg_path: str, overrides=None):
             n_splits = int(cb_cfg.get("n_splits", 4))
             scale = str(cb_cfg.get("scale", "conus"))
             fold_index = int(cb_cfg.get("fold_index", 0))
-            # Use dataset coordinates (lat, lon) directly
-            coords = ds.coords  # shape (N, 2)
-            run_dir = run_results_dir  # or wherever you want to save the figure
+            coords = ds.coords
             visualize_checkerboard_split(
                 coords=coords,
                 grid_deg=grid_deg,
                 n_splits=n_splits,
                 scale=scale,
-                run_dir=run_dir,
+                run_dir=run_results_dir,
                 fold_index=fold_index,
             )
-
     # Physical config
     data_cfg = cfg.get('data', {})
-    z_feature_indices = data_cfg.get('z_feature_indices', [])
+    z_feature_indices = data_cfg.get('z_feature_indices', []) or []
+    z_aux_feature_indices = data_cfg.get('z_aux_feature_indices', []) or []
     physical_out_dim = len(z_feature_indices)
-    # Base weight for physical loss (may be dynamically updated)
+    aux_physical_out_dim = len(z_aux_feature_indices)
+    # Base weight for physical loss
     loss_weight_physical = float(cfg['train'].get('loss_weight_physical', 0.0))
-
     # Location / model config
     loc_cfg = cfg.get('model', {}).get('location', {}) or {}
     loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
     use_location = bool(loc_name and loc_name not in ('none', ''))
     loc_variant = str(loc_cfg.get('variant', '') or '').lower()
-    # Return month/day-of-year when location is used and variant is specified
-    # Determine whether to return a temporal index for the model in training.
-    # The model should receive a temporal index whenever the location variant
-    # contains "doy" or "month"/"monthly".  This includes variants such as
-    # "doy-hadamard" or "monthly-concat".
     return_month = False
     if use_location and loc_variant:
         lv2 = str(loc_variant)
         if ('doy' in lv2) or ('month' in lv2):
             return_month = True
     physical_head_hidden_dim = cfg['model'].get('physical_head_hidden_dim', cfg['model']['attention']['attn_dim'])
-
-    # Build model with optional head dropout
+    aux_physical_head_hidden_dim = cfg['model'].get('aux_physical_head_hidden_dim', physical_head_hidden_dim)
+    # Build model
     head_dropout = cfg['model'].get('head_dropout', None)
     if use_location:
         model = BiLSTMAttnLocRegressor(
@@ -674,9 +717,10 @@ def run(cfg_path: str, overrides=None):
             loc_proj_dim=loc_cfg.get('proj_dim'),
             fusion_method=loc_cfg.get('fusion', 'concat'),
             fusion_hidden_dim=loc_cfg.get('head_hidden_dim', cfg['model']['attention']['attn_dim']),
-            # NEW: physical head
             physical_head_hidden_dim=physical_head_hidden_dim if physical_out_dim > 0 else None,
             physical_out_dim=physical_out_dim,
+            aux_physical_head_hidden_dim=aux_physical_head_hidden_dim if aux_physical_out_dim > 0 else None,
+            aux_physical_out_dim=aux_physical_out_dim,
             head_dropout=head_dropout,
         ).to(device)
     else:
@@ -691,7 +735,6 @@ def run(cfg_path: str, overrides=None):
             attn_dim=cfg['model']['attention']['attn_dim'],
             head_dropout=head_dropout,
         ).to(device)
-
     # --- Setup banner ---
     log.info("---- RUN SETUP ----")
     log.info("Device: %s | Mixed Precision: %s", device, bool(cfg['train'].get('mixed_precision') and device.type == 'cuda'))
@@ -712,36 +755,33 @@ def run(cfg_path: str, overrides=None):
             loc_cfg.get('head_hidden_dim'),
         )
     log.info("Train from scratch: %s", from_scratch)
-    log.info("Physical head: %s (out_dim=%d)", "ENABLED" if physical_out_dim > 0 else "DISABLED", physical_out_dim)
+    log.info(
+        "Physical head: %s (out_dim=%d) | Aux physical head: %s (out_dim=%d)",
+        "ENABLED" if physical_out_dim > 0 else "DISABLED", physical_out_dim,
+        "ENABLED" if aux_physical_out_dim > 0 else "DISABLED", aux_physical_out_dim,
+    )
     log.info(
         "Loss weight c (physical): %.4f%s",
         loss_weight_physical,
-        "  [diagnostic-only]" if loss_weight_physical == 0.0 and physical_out_dim > 0 else "",
+        "  [diagnostic-only]" if loss_weight_physical == 0.0 and (physical_out_dim > 0 or aux_physical_out_dim > 0) else "",
     )
-
-    # --- Parameter counts ---
+    # Parameter counts
     tot, trn, frz = _count_params(model)
     log.info(
         "Parameters: total=%s | trainable=%s | frozen=%s",
-        f"{tot:,}",
-        f"{trn:,}",
-        f"{frz:,}",
+        f"{tot:,}", f"{trn:,}", f"{frz:,}",
     )
     if trn == 0:
         log.warning("WARNING: 0 trainable parameters detected — check 'pretrained'/'freeze' and from_scratch settings.")
-
-    # Optional breakdown by top‑level submodule (useful to confirm loc encoder is trainable)
     _top = _count_params_by_top(model)
     for k, v in sorted(_top.items(), key=lambda kv: kv[0]):
         log.info("  [%s] trainable=%s / total=%s", k, f"{v['trainable']:,}", f"{v['total']:,}")
-
     # Optimizer / scheduler / loss
     opt_cfg = cfg['train'].get('optimizer', {})
     opt_name = str(opt_cfg.get('name', 'adam')).lower()
     lr = float(opt_cfg.get('lr', 1e-3))
     default_wd = float(opt_cfg.get('weight_decay', 0.0))
     branch_wd = opt_cfg.get('branch_weight_decay', {}) or {}
-    # Build parameter groups with branch‑specific weight decay
     param_groups = []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -752,7 +792,6 @@ def run(cfg_path: str, overrides=None):
     if opt_name == 'adamw':
         opt = torch.optim.AdamW(param_groups, lr=lr, weight_decay=0.0)
     else:
-        # fall back to Adam; use zero global weight decay since per‑group values are set
         opt = torch.optim.Adam(param_groups, lr=lr, weight_decay=0.0)
     sched = make_scheduler(opt, cfg)
     scfg = cfg['train'].get('scheduler', {})
@@ -773,46 +812,37 @@ def run(cfg_path: str, overrides=None):
             )
         ),
     )
-
     loss_fn = nn.HuberLoss()
     use_amp = bool(cfg['train'].get('mixed_precision') and device.type == 'cuda')
     try:
         scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
         amp_autocast = (lambda: torch.amp.autocast('cuda')) if use_amp else (lambda: contextlib.nullcontext())
     except TypeError:
-        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)  # older API
+        scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
         amp_autocast = (lambda: torch.cuda.amp.autocast()) if use_amp else (lambda: contextlib.nullcontext())
-
     writer = SummaryWriter(run_tb_dir) if cfg['logging']['tensorboard'] else None
-
     # CSV logs
     epoch_csv_path = os.path.join(run_results_dir, "train.epochs.csv")
     step_csv_path = os.path.join(run_results_dir, "train.steps.csv")
     save_epoch_csv = True
     save_step_csv = False
     step_every = int(cfg['logging'].get('step_csv_every_n', 50))
-
     def _append_csv_row(path: str, row: dict) -> None:
         if not path:
             return
         os.makedirs(os.path.dirname(path), exist_ok=True)
         exists = os.path.exists(path)
         pd.DataFrame([row]).to_csv(path, mode='a', index=False, header=not exists)
-
     best_val = float('inf')
     best_epoch = -1
     patience = int(cfg['train']['early_stopping']['patience'])
-
-    # ----------------------- NCAR augmentation setup ----------------------- #
+    # NCAR augmentation setup
     ncar_ratio = float(cfg['train'].get('ncar_random_ratio', 0.0))
     ncar_ratio = max(0.0, ncar_ratio)
-    ncar_path = cfg['data'].get('ncar_grid_path', '/home/zhongying/Documents/loc4pm/dataset/ncar_grid_parquet/')
-    # Load NCAR grid data via the dataset helper.  If loading fails or
-    # sampling yields no points, disable augmentation.
+    ncar_path = cfg['data'].get('ncar_grid_path', '')
     if ncar_ratio > 0.0 and physical_out_dim > 0:
         try:
             _load_ncar_grid_ds(ncar_path)
-            # probe sampling to verify data is loaded
             test_coords, _, _ = _sample_ncar_points_ds(1)
             if test_coords.size == 0:
                 log.warning("NCAR random ratio requested but no data loaded from %s", ncar_path)
@@ -822,8 +852,7 @@ def run(cfg_path: str, overrides=None):
         except Exception as e:
             log.warning("Failed to load NCAR grid from %s: %s", ncar_path, e)
             ncar_ratio = 0.0
-
-    # --------------------- dynamic weight update setup -------------------- #
+    # Dynamic weighting setup
     dwa_cfg = cfg['train'].get('loss_weight_physical_dynamic', {}) or {}
     dwa_enabled = bool(dwa_cfg.get('enabled', False))
     dwa_temp = float(dwa_cfg.get('temperature', 2.0)) if dwa_enabled else None
@@ -832,7 +861,6 @@ def run(cfg_path: str, overrides=None):
     prev_prev_pred_loss_epoch = None
     prev_phys_loss_epoch = None
     prev_prev_phys_loss_epoch = None
-
     # ----------------------------- training -------------------------------- #
     train_start = time.perf_counter()
     for epoch in range(1, cfg['train']['epochs'] + 1):
@@ -840,32 +868,35 @@ def run(cfg_path: str, overrides=None):
         model.train()
         tr_tot_losses, tr_pred_losses, tr_phys_losses = [], [], []
         seen = 0
-        # Track how many random NCAR samples are drawn this epoch
         rand_total_samples = 0
-
         expect_z = (physical_out_dim > 0)
+        expect_z_aux = (aux_physical_out_dim > 0)
         for i, batch in enumerate(train_loader):
-            x, coords, month_t, z, y = _parse_batch(batch, use_location, return_month, expect_z=expect_z)
+            x, coords, month_t, z, z_aux, y = _parse_batch(batch, use_location, return_month, expect_z=expect_z, expect_z_aux=expect_z_aux)
             bs = x.shape[0]
             seen += bs
             x = x.to(device)
             y = y.to(device).squeeze(-1)
             coords = coords.to(device) if coords is not None else None
             month_t = month_t.to(device) if month_t is not None else None
-            z = z.to(device).squeeze(-1) if z is not None else None
-
+            z = z.to(device) if z is not None else None
+            z_aux = z_aux.to(device) if z_aux is not None else None
             opt.zero_grad(set_to_none=True)
             if scaler.is_enabled():
                 with amp_autocast():
                     out = model(x, coords, month_t) if use_location else model(x)
-                    yhat, zhat, _ = _split_model_outputs(out)
+                    yhat, zhat, zhat_aux, _ = _split_model_outputs(out)
                     pred_loss = loss_fn(yhat, y)
-                    # Compute physical loss for dataset samples
+                    # compute physical loss on dataset samples
                     phys_loss_ds = torch.tensor(0.0, device=device)
-                    if expect_z and (zhat is not None) and (z is not None):
-                        zpred = zhat.squeeze(-1)
-                        phys_loss_ds = loss_fn(zpred, z)
-                    # Sample additional NCAR points if enabled
+                    if expect_z and zhat is not None and z is not None:
+                        loss_main = loss_fn(zhat, z)
+                        if expect_z_aux and zhat_aux is not None and z_aux is not None:
+                            loss_aux = loss_fn(zhat_aux, z_aux)
+                            phys_loss_ds = (loss_main + loss_aux) / 2.0
+                        else:
+                            phys_loss_ds = loss_main
+                    # sample additional NCAR points if enabled (only for primary physical)
                     phys_loss_rand = torch.tensor(0.0, device=device)
                     n_rand = 0
                     if ncar_ratio > 0.0 and expect_z:
@@ -873,13 +904,15 @@ def run(cfg_path: str, overrides=None):
                         rand_total_samples += n_rand
                         if n_rand > 0:
                             coords_rand_np, month_rand_np, z_rand_np = _sample_ncar_points_ds(n_rand)
-                            # In the training loop, after sampling random NCAR points:
-                            if z_scaler is not None:
-                                # reshape to [N, 1, 1] to match scaler input
-                                z_reshaped = z_rand_np.reshape(-1, 1, 1)
-                                # apply the scaler’s transform_x method and flatten back
-                                z_scaled = z_scaler.transform_x(z_reshaped).reshape(-1)
-                                z_rand_np = z_scaled.astype(np.float32)
+                            # standardize random z using dataset stats or scaler
+                            if z_rand_np.size > 0:
+                                if z_mean is not None and z_std is not None:
+                                    # z_rand_np may be 1D array of shape [n_rand]
+                                    z_rand_np = ((z_rand_np - z_mean) / z_std).astype(np.float32)
+                                elif z_scaler is not None:
+                                    z_reshaped = z_rand_np.reshape(-1, 1, 1)
+                                    z_scaled = z_scaler.transform_x(z_reshaped).reshape(-1)
+                                    z_rand_np = z_scaled.astype(np.float32)
                             if coords_rand_np.size > 0:
                                 coords_rand = torch.tensor(coords_rand_np, dtype=torch.float32, device=device)
                                 month_rand = (
@@ -888,15 +921,13 @@ def run(cfg_path: str, overrides=None):
                                     else None
                                 )
                                 z_rand = torch.tensor(z_rand_np, dtype=torch.float32, device=device)
-                                # Obtain location embeddings and z predictions directly via the physical head
+                                # obtain location embeddings and primary z predictions
                                 loc_rand_emb = model.loc_encoder(coords_rand, month_rand) if use_location else None
                                 if loc_rand_emb is not None and model.physical_head is not None:
                                     zhat_rand = model.physical_head(loc_rand_emb)
-                                    zpred_rand = zhat_rand.squeeze(-1)
-                                    phys_loss_rand = loss_fn(zpred_rand, z_rand)
-                    # Combine physical losses by normalizing over sample counts
+                                    phys_loss_rand = loss_fn(zhat_rand, z_rand)
+                    # combine physical losses across dataset and random samples
                     if expect_z and (bs + n_rand) > 0:
-                        # Convert mean losses back to sums, then average
                         total_phys_loss = phys_loss_ds * bs + phys_loss_rand * max(n_rand, 0)
                         phys_loss = total_phys_loss / float(bs + n_rand)
                     else:
@@ -910,12 +941,16 @@ def run(cfg_path: str, overrides=None):
                 scaler.update()
             else:
                 out = model(x, coords, month_t) if use_location else model(x)
-                yhat, zhat, _ = _split_model_outputs(out)
+                yhat, zhat, zhat_aux, _ = _split_model_outputs(out)
                 pred_loss = loss_fn(yhat, y)
                 phys_loss_ds = torch.tensor(0.0, device=device)
-                if expect_z and (zhat is not None) and (z is not None):
-                    zpred = zhat.squeeze(-1)
-                    phys_loss_ds = loss_fn(zpred, z)
+                if expect_z and zhat is not None and z is not None:
+                    loss_main = loss_fn(zhat, z)
+                    if expect_z_aux and zhat_aux is not None and z_aux is not None:
+                        loss_aux = loss_fn(zhat_aux, z_aux)
+                        phys_loss_ds = (loss_main + loss_aux) / 2.0
+                    else:
+                        phys_loss_ds = loss_main
                 phys_loss_rand = torch.tensor(0.0, device=device)
                 n_rand = 0
                 if ncar_ratio > 0.0 and expect_z:
@@ -923,6 +958,13 @@ def run(cfg_path: str, overrides=None):
                     rand_total_samples += n_rand
                     if n_rand > 0:
                         coords_rand_np, month_rand_np, z_rand_np = _sample_ncar_points_ds(n_rand)
+                        if z_rand_np.size > 0:
+                            if z_mean is not None and z_std is not None:
+                                z_rand_np = ((z_rand_np - z_mean) / z_std).astype(np.float32)
+                            elif z_scaler is not None:
+                                z_reshaped = z_rand_np.reshape(-1, 1, 1)
+                                z_scaled = z_scaler.transform_x(z_reshaped).reshape(-1)
+                                z_rand_np = z_scaled.astype(np.float32)
                         if coords_rand_np.size > 0:
                             coords_rand = torch.tensor(coords_rand_np, dtype=torch.float32, device=device)
                             month_rand = (
@@ -934,8 +976,7 @@ def run(cfg_path: str, overrides=None):
                             loc_rand_emb = model.loc_encoder(coords_rand, month_rand) if use_location else None
                             if loc_rand_emb is not None and model.physical_head is not None:
                                 zhat_rand = model.physical_head(loc_rand_emb)
-                                zpred_rand = zhat_rand.squeeze(-1)
-                                phys_loss_rand = loss_fn(zpred_rand, z_rand)
+                                phys_loss_rand = loss_fn(zhat_rand, z_rand)
                 if expect_z and (bs + n_rand) > 0:
                     total_phys_loss = phys_loss_ds * bs + phys_loss_rand * max(n_rand, 0)
                     phys_loss = total_phys_loss / float(bs + n_rand)
@@ -946,17 +987,14 @@ def run(cfg_path: str, overrides=None):
                 if cfg['train'].get('grad_clip_norm') is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip_norm'])
                 opt.step()
-
             tr_tot_losses.append(loss.item())
             tr_pred_losses.append(pred_loss.item())
             tr_phys_losses.append(float(phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss))
-
             # TB step logs
             if writer and (i + 1) % cfg['logging']['log_every_steps'] == 0:
                 writer.add_scalar('train/step_total_loss', loss.item(), i + (epoch - 1) * len(train_loader))
                 writer.add_scalar('train/step_pred_loss', pred_loss.item(), i + (epoch - 1) * len(train_loader))
                 writer.add_scalar('train/step_phys_loss', tr_phys_losses[-1], i + (epoch - 1) * len(train_loader))
-
             # Optional CSV per‑step
             if save_step_csv and ((i + 1) % step_every == 0):
                 _append_csv_row(
@@ -970,40 +1008,31 @@ def run(cfg_path: str, overrides=None):
                         'lr': float(opt.param_groups[0]['lr']),
                     },
                 )
-
         # Compute epoch-level statistics
         tr_total = float(np.mean(tr_tot_losses)) if tr_tot_losses else float('nan')
         tr_pred = float(np.mean(tr_pred_losses)) if tr_pred_losses else float('nan')
         tr_phys = float(np.mean(tr_phys_losses)) if tr_phys_losses else 0.0
-
         ep_sec = time.perf_counter() - ep_t0
         samples_per_sec = seen / ep_sec if ep_sec > 0 else float('nan')
-        # Include the number of random NCAR samples drawn in the epoch in the log
         log.info(
             f"Epoch {epoch:03d} | train_total={tr_total:.5f} | pred={tr_pred:.5f} | phys={tr_phys:.5f} | "
             f"lr={opt.param_groups[0]['lr']:.3e} | samples={seen} | rand_samples={rand_total_samples} | "
             f"{samples_per_sec:.1f} samples/s | duration={ep_sec:.1f}s"
         )
-
         if writer:
             writer.add_scalar('train/epoch_total_loss', tr_total, epoch)
             writer.add_scalar('train/epoch_pred_loss', tr_pred, epoch)
             writer.add_scalar('train/epoch_phys_loss', tr_phys, epoch)
             writer.add_scalar('opt/lr', opt.param_groups[0]['lr'], epoch)
-
-        # ---------- dynamic loss weight update ----------
+        # Dynamic loss weight update
         if dwa_enabled:
             if prev_pred_loss_epoch is not None and prev_prev_pred_loss_epoch is not None and prev_phys_loss_epoch is not None and prev_prev_phys_loss_epoch is not None:
                 ratio_pred = prev_pred_loss_epoch / max(prev_prev_pred_loss_epoch, 1e-8)
                 ratio_phys = prev_phys_loss_epoch / max(prev_prev_phys_loss_epoch, 1e-8)
-                # Compute weighting ratio using softmax across two tasks
                 exp_pred = np.exp(ratio_pred / dwa_temp)
                 exp_phys = np.exp(ratio_phys / dwa_temp)
-                # weight for physical relative to prediction
                 weight_ratio = exp_phys / exp_pred
-                # Update the loss weight multiplicatively
                 loss_weight_physical = loss_weight_physical * weight_ratio
-                # Optionally cap the weight to prevent explosion
                 if dwa_cap is not None:
                     loss_weight_physical = float(min(loss_weight_physical, dwa_cap))
                 log.info(
@@ -1012,12 +1041,10 @@ def run(cfg_path: str, overrides=None):
                 )
                 if writer:
                     writer.add_scalar('train/loss_weight_physical', loss_weight_physical, epoch)
-            # update historical losses for next epoch
             prev_prev_pred_loss_epoch = prev_pred_loss_epoch
             prev_pred_loss_epoch = tr_pred
             prev_prev_phys_loss_epoch = prev_phys_loss_epoch
             prev_phys_loss_epoch = tr_phys
-
         # --------------------------- validation ---------------------------- #
         if val_loader is not None:
             val_total, val_pred, val_phys, y_pred_val, y_true_val = evaluate(
@@ -1028,10 +1055,10 @@ def run(cfg_path: str, overrides=None):
                 use_location=use_location,
                 return_month=return_month,
                 return_z=(physical_out_dim > 0),
+                return_z_aux=(aux_physical_out_dim > 0),
                 loss_weight_physical=loss_weight_physical,
             )
             log.info(f"Epoch {epoch:03d} | val_total={val_total:.5f} | pred={val_pred:.5f} | phys={val_phys:.5f}")
-
             if save_epoch_csv:
                 _append_csv_row(
                     epoch_csv_path,
@@ -1092,9 +1119,7 @@ def run(cfg_path: str, overrides=None):
                 )
             if sched is not None and not isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
                 sched.step()
-
     # ------------------------------ export --------------------------------- #
-    # Export validation predictions if available and requested
     if val_loader is not None and cfg['eval']['save_val_predictions']:
         out_csv = cfg['eval']['out_csv_val']
         mets_json = os.path.splitext(out_csv)[0] + '.metrics.json'
@@ -1107,16 +1132,13 @@ def run(cfg_path: str, overrides=None):
             use_location=use_location,
             return_month=return_month,
             return_z=(physical_out_dim > 0),
+            return_z_aux=(aux_physical_out_dim > 0),
             loss_weight_physical=loss_weight_physical,
         )
-        # Extract latitudes, longitudes and dates for the validation indices.  These are needed for residual analysis.
-        # Coordinates are stored in ds.coords and dates can be looked up via ds.dates and index_map.
         if val_idx.size > 0:
-            # lat/lon arrays correspond to the order of val_idx used by DataLoader
             latlon_val = ds.coords[val_idx]
             lats_val = latlon_val[:, 0]
             lons_val = latlon_val[:, 1]
-            # Derive date strings from the file index (fid) in ds.index_map
             dates_val = [ds.dates[ds.index_map[int(idx)][0]] for idx in val_idx]
         else:
             lats_val = None
@@ -1124,8 +1146,6 @@ def run(cfg_path: str, overrides=None):
             dates_val = None
         mets = save_predictions_and_metrics(y_true_val, y_pred_val, ysc_path, out_csv, mets_json, lat=lats_val, lon=lons_val, dates=dates_val)
         logging.info("Validation metrics:\n%s", json.dumps(mets, indent=2))
-
-    # Export test predictions if there is a test split
     if test_idx.size > 0:
         test_loader = DataLoader(
             Subset(ds, test_idx),
@@ -1143,22 +1163,20 @@ def run(cfg_path: str, overrides=None):
             use_location=use_location,
             return_month=return_month,
             return_z=(physical_out_dim > 0),
+            return_z_aux=(aux_physical_out_dim > 0),
             loss_weight_physical=loss_weight_physical,
         )
         out_csv_t = cfg['eval']['out_csv_test']
         mets_json_t = os.path.splitext(out_csv_t)[0] + '.metrics.json'
         ysc_path = os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib')
-        # Extract latitudes, longitudes and dates for the test indices.
         latlon_test = ds.coords[test_idx]
         lats_test = latlon_test[:, 0]
         lons_test = latlon_test[:, 1]
         dates_test = [ds.dates[ds.index_map[int(idx)][0]] for idx in test_idx]
         tmets = save_predictions_and_metrics(y_true_t, y_pred_t, ysc_path, out_csv_t, mets_json_t, lat=lats_test, lon=lons_test, dates=dates_test)
         logging.info("Test metrics:\n%s", json.dumps(tmets, indent=2))
-
     if writer:
         writer.close()
-
     total_sec = time.perf_counter() - (train_start)
     log.info("Training finished in %.1fs (%.1f minutes)", total_sec, total_sec / 60.0)
 

@@ -69,7 +69,6 @@ core.*
 *.core
 
 # ---- Data & big binaries (top-level only; safe for your code at loc4pm/data/)
-data/
 datasets/
 *.parquet
 *.feather

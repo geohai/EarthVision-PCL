@@ -1,14 +1,13 @@
-"""BiLSTM with attention and location embedding fusion for LOC4PM.
+"""BiLSTM with attention, location fusion and dual physical heads for LOC4PM.
 
-This module extends the baseline BiLSTM with Luong attention by optionally
-incorporating a geolocation encoder.  Supported encoders include the
-Climplicit, GeoCLIP and SatCLIP models from the ``rshf`` package as well
-as local SIREN implementations (:mod:`loc4pm.models.siren`) and an
-RFF‑based location encoder (:mod:`loc4pm.models.rff_encoder`).
-
-If a requested encoder cannot be imported, a simple MLP fallback is used to
-map the latitude/longitude (and optionally a temporal index) to a fixed‑size
-embedding.
+This module extends the original ``BiLSTMAttnLocRegressor`` by adding support
+for an auxiliary physical head.  The primary physical head predicts the
+main physical target (e.g. PM2.5), while the auxiliary head predicts
+additional physical variables such as meteorological conditions (e.g.
+``AIR_DENS``, ``RH``, ``SFC_TMP``, etc.).  Both heads operate on the
+location embedding produced by the location encoder.  The observation
+head remains unchanged and predicts the pollution observation ``y`` from
+the fused time-series and location embeddings.
 """
 
 from __future__ import annotations
@@ -32,19 +31,9 @@ class LocationEncoderWrapper(nn.Module):
     """Wrapper around optional external or local location encoders.
 
     This helper attempts to construct a location encoder according to
-    user configuration.  Supported encoders include:
-
-    * ``climplicit`` – the Climplicit encoder from the ``rshf`` package.
-    * ``geoclip`` – the GeoCLIP encoder from ``rshf``.
-    * ``satclip`` – the SatCLIP encoder from ``rshf``.
-    * ``siren`` / ``resiren`` – a local SIREN or ReSIREN implementation with
-      optional temporal variants (monthly or day‑of‑year).
-    * ``rff`` – a local random Fourier feature encoder with optional
-      day‑of‑year temporal encoding.
-
-    If the specified encoder name is ``None`` or ``"none"``, the wrapper
-    constructs an identity mapping.  If the import fails or the encoder
-    cannot be constructed, a simple MLP fallback is used instead.
+    user configuration.  Supported encoders include: ``climplicit``,
+    ``geoclip``, ``satclip``, ``siren``, ``resiren``, and ``geoclip-time``.
+    If the specified encoder cannot be loaded, a fallback MLP is used.
     """
 
     def __init__(
@@ -63,16 +52,13 @@ class LocationEncoderWrapper(nn.Module):
         self.project_dim = project_dim
         self.pretrained = pretrained
         self.freeze = freeze
-
-        self.encoder: Optional[nn.Module] = None  # will hold external or local encoder
+        self.encoder: Optional[nn.Module] = None
         encoder_loaded = False
-
-        # Attempt to lazily import the requested encoder
+        # Attempt to load requested encoder
         if name is not None and str(name).lower() not in ('none', ''):
             lname = str(name).lower()
             try:
                 if lname == 'climplicit':
-                    # Climplicit encoder has annual (1024‑d) and monthly (256‑d) modes.
                     from rshf.climplicit import Climplicit  # type: ignore
                     model_name = "Jobedo/climplicit"
                     cfg = {"return_chelsa": False}
@@ -82,37 +68,32 @@ class LocationEncoderWrapper(nn.Module):
                         self.encoder = Climplicit(config=cfg)
                     encoder_loaded = True
                 elif lname == 'geoclip':
-                    # GeoCLIP expects coordinates in [lat, lon] order.
                     from rshf.geoclip import GeoCLIP, GeoCLIPConfig  # type: ignore
                     model_name = "MVRL/geoclip-location-encoder"
                     if pretrained:
                         self.encoder = GeoCLIP.from_pretrained(model_name)
                     else:
-                        # basic config for untrained GeoCLIP
                         self.encoder = GeoCLIP(GeoCLIPConfig(sigma=[2, 2**2], input_size=2, encoded_size=256, dim=512))
                     encoder_loaded = True
                 elif lname == 'satclip':
-                    # SatCLIP expects coordinates in [lon, lat] order.
                     from rshf.satclip import SatClip  # type: ignore
                     model_name = "MVRL/satclip-loc-enc-vit16-l40"
                     if pretrained:
                         self.encoder = SatClip.from_pretrained(model_name)
                     else:
                         self.encoder = SatClip()
-                    # self.encoder = self.encoder.to(dtype=torch.float32)
                     encoder_loaded = True
                 elif lname in ('siren', 'resiren'):
-                    # rshf‑style composition: Direct -> SIREN with optional temporal variant
                     var = str(self.variant).lower() if self.variant is not None else None
                     monthly_flag = (var == 'monthly') if var is not None else bool(self.variant and str(self.variant).lower() == 'monthly')
                     self.encoder = DirectSirenEncoder(
                         emb_dim=emb_dim,
-                        dim_hidden=max(emb_dim, 512),  # 512 matches climplicit
-                        num_layers=16,  # 16 matches climplicit
+                        dim_hidden=max(emb_dim, 512),
+                        num_layers=16,
                         residual=(lname == 'resiren'),
                         h_siren=True,
                         w0=1.0,
-                        w0_initial=30.0,  # set 30.0 to mirror rshf exactly
+                        w0_initial=30.0,
                         monthly=monthly_flag,
                         variant=var,
                     )
@@ -123,12 +104,10 @@ class LocationEncoderWrapper(nn.Module):
                     if pretrained:
                         base = GeoCLIP.from_pretrained(model_name)
                     else:
-                        base = GeoCLIP(GeoCLIPConfig(sigma=[2, 2 ** 2], input_size=2,
-                                                     encoded_size=256, dim=512))
+                        base = GeoCLIP(GeoCLIPConfig(sigma=[2, 2 ** 2], input_size=2, encoded_size=256, dim=512))
                     if freeze:
                         for p in base.parameters():
                             p.requires_grad = False
-
                     v = (variant or "").lower()
                     if "had" in v:
                         fusion_mode = "hadamard"
@@ -158,10 +137,8 @@ class LocationEncoderWrapper(nn.Module):
                     variant,
                     e,
                 )
-
-        # If no external or local encoder was loaded, create a simple MLP fallback
+        # Fallback MLP if no external encoder was loaded
         if not encoder_loaded or self.encoder is None:
-            # Determine whether a temporal input should be consumed
             var_l = str(self.variant).lower() if self.variant is not None else None
             has_temporal = var_l in ('monthly', 'doy') if var_l is not None else False
             input_dim = 2 + (1 if has_temporal else 0)
@@ -172,39 +149,20 @@ class LocationEncoderWrapper(nn.Module):
                 nn.Linear(hidden_dim, emb_dim),
             )
             encoder_loaded = False
-
-        # Optionally freeze the underlying encoder parameters
+        # Freeze parameters if requested
         if self.encoder is not None and freeze:
             for p in self.encoder.parameters():
                 p.requires_grad = False
-        # Optional projection layer: if provided, this maps the raw encoder output
-        # to a user‑specified dimension (useful when performing Hadamard fusion).
+        # Optional projection
         if project_dim is not None and project_dim > 0:
             self.proj = nn.Linear(emb_dim, project_dim, bias=False)
             self.output_dim = project_dim
         else:
             self.proj = None
             self.output_dim = emb_dim
-        # LayerNorm for the location embedding; helps stabilize training
         self.norm = nn.LayerNorm(self.output_dim)
 
     def forward(self, coords: torch.Tensor, month: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """Compute a location embedding.
-
-        Parameters
-        ----------
-        coords : torch.Tensor
-            Tensor of shape ``[B, 2]`` containing latitude and longitude in degrees.
-        month : Optional[torch.Tensor], default=None
-            Optional tensor of shape ``[B]`` or ``[B,1]`` containing temporal
-            indices.  Its interpretation depends on the variant: month (1–12) for
-            ``variant="monthly"`` or day‑of‑year (1–365) for ``variant="doy"``.
-
-        Returns
-        -------
-        torch.Tensor
-            Tensor of shape ``[B, output_dim]`` containing the location embedding.
-        """
         if coords is None:
             raise ValueError("coords tensor must be provided for location encoding")
         # Ensure month is a column vector if provided
@@ -213,59 +171,43 @@ class LocationEncoderWrapper(nn.Module):
                 month = month.squeeze()
             month = month.to(dtype=coords.dtype)
         lname = (self.name or '').lower()
-        # Use external or local encoder if available
         if lname == 'climplicit':
-            # Climplicit expects [lon, lat] order
             xy = torch.stack([coords[:, 1], coords[:, 0]], dim=1)
             if self.variant and str(self.variant).lower() == 'monthly' and month is not None:
                 out = self.encoder(xy, month)
             else:
                 out = self.encoder(xy)
         elif lname == 'geoclip':
-            # GeoCLIP expects [lat, lon]
             out = self.encoder(coords)
         elif lname == 'satclip':
-            # SatCLIP expects [lon, lat]
             xy = torch.stack([coords[:, 1], coords[:, 0]], dim=1)
             xy = xy.double()
             out = self.encoder(xy)
             out = out.float()
-            # Run SatCLIP in fp32 even if the rest of training uses AMP
-            # with torch.autocast(device_type=xy.device.type, enabled=False):
-            #     out = self.encoder(xy)
         elif lname in ('siren', 'resiren'):
-            # For local encoders we delegate handling of the temporal index
             out = self.encoder(coords, month)
         elif lname in ('geoclip-time', 'geoclip_time'):
             out = self.encoder(coords, month)
         else:
-            # Fallback MLP: concatenate coords and (optionally) temporal index
             if month is not None:
                 inp = torch.cat([coords, month.unsqueeze(-1)], dim=1)
             else:
                 inp = coords
             out = self.encoder(inp)
-        # Project if required
         if self.proj is not None:
             out = self.proj(out)
-        # Normalize
-        # print("out dtype:", out.dtype)
-        # print("norm weight dtype:", self.norm.weight.dtype)
         out = self.norm(out)
         return out
 
 
 class BiLSTMAttnLocRegressor(nn.Module):
-    """Bi‑LSTM regressor with attention, optional location fusion, and a physical head.
+    """Bi‑LSTM regressor with attention, location fusion, and dual physical heads.
 
-    This model extends the base BiLSTM regressor by fusing a location
-    embedding with the LSTM's attention‑derived context vector.  Fusion is
-    either via element‑wise multiplication (Hadamard) or concatenation.  In
-    addition to predicting a scalar observation target ``y`` from the fused
-    representation, the model can optionally predict one or more physical
-    simulation variables ``z`` directly from the location embedding via a
-    small MLP (``physical_head``).  The number of outputs for the
-    physical head is specified at construction time.
+    In addition to predicting the observation target ``y`` from the fused
+    time-series and location embedding, this model optionally predicts a
+    primary physical vector ``z`` via a ``physical_head`` and an auxiliary
+    physical vector ``z_aux`` via ``aux_physical_head``.  Both heads map
+    from the location embedding to their respective output dimensions.
     """
 
     def __init__(
@@ -289,10 +231,13 @@ class BiLSTMAttnLocRegressor(nn.Module):
         fusion_hidden_dim: int = 256,
         physical_head_hidden_dim: Optional[int] = None,
         physical_out_dim: int = 0,
+        # new parameters for auxiliary physical head
+        aux_physical_head_hidden_dim: Optional[int] = None,
+        aux_physical_out_dim: int = 0,
         head_dropout: Optional[float] = None,
     ) -> None:
         super().__init__()
-        # Sequence branch: BiLSTM producing temporal embeddings
+        # Sequence branch
         self.lstm = nn.LSTM(
             input_size,
             hidden_size,
@@ -303,11 +248,8 @@ class BiLSTMAttnLocRegressor(nn.Module):
         )
         self.bidirectional = bidirectional
         self.ts_ctx_dim = hidden_size * (2 if bidirectional else 1)
-        # Normalization for the LSTM outputs
         self.norm = nn.LayerNorm(self.ts_ctx_dim) if layer_norm else nn.Identity()
-        # Attention mechanism
         self.attn = LuongAttention(self.ts_ctx_dim, attn_dim if attn_type == 'luong' else None)
-        # Location encoder (optional)
         self.loc_encoder: Optional[LocationEncoderWrapper] = None
         if loc_name and str(loc_name).lower() not in ('none', ''):
             self.loc_encoder = LocationEncoderWrapper(
@@ -321,9 +263,8 @@ class BiLSTMAttnLocRegressor(nn.Module):
             loc_emb_out = self.loc_encoder.output_dim
         else:
             loc_emb_out = 0
-        # Determine location embedding dimensionality after projection (if projection is used)
+        # Determine location embedding dimensionality after projection
         loc_dim = loc_proj_dim if (loc_proj_dim is not None) else loc_emb_dim
-        # Determine the fused input dimension for the observation head
         fm = fusion_method.lower() if fusion_method else 'concat'
         if fm == 'concat':
             fused_in = self.ts_ctx_dim + loc_dim
@@ -337,11 +278,6 @@ class BiLSTMAttnLocRegressor(nn.Module):
         else:
             raise ValueError(f"Unknown fusion method: {fusion_method}")
         self.fusion_method = fm
-        # Observation regression head: maps fused representation to a scalar
-        # Allow optional dropout on the hidden and/or output layer to improve generalization.  If
-        # ``head_dropout`` is ``None``, fall back to no dropout to preserve prior behavior.  We
-        # insert the dropout after the first activation so that it stochastically zeros hidden
-        # activations before the final linear layer.
         hd = float(dropout) if head_dropout is None else float(head_dropout)
         self.head = nn.Sequential(
             nn.Linear(fused_in, fusion_hidden_dim),
@@ -349,7 +285,7 @@ class BiLSTMAttnLocRegressor(nn.Module):
             nn.Dropout(hd),
             nn.Linear(fusion_hidden_dim, 1),
         )
-        # Physical simulation head: maps location embedding to one or more outputs
+        # Primary physical head
         self.physical_head: Optional[nn.Module] = None
         if physical_out_dim and physical_head_hidden_dim is not None and physical_out_dim > 0:
             self.physical_head = nn.Sequential(
@@ -358,6 +294,15 @@ class BiLSTMAttnLocRegressor(nn.Module):
                 nn.Linear(physical_head_hidden_dim, physical_out_dim),
             )
         self.physical_out_dim = physical_out_dim
+        # Auxiliary physical head
+        self.aux_physical_head: Optional[nn.Module] = None
+        if aux_physical_out_dim and aux_physical_head_hidden_dim is not None and aux_physical_out_dim > 0:
+            self.aux_physical_head = nn.Sequential(
+                nn.Linear(loc_dim, aux_physical_head_hidden_dim),
+                nn.ReLU(),
+                nn.Linear(aux_physical_head_hidden_dim, aux_physical_out_dim),
+            )
+        self.aux_physical_out_dim = aux_physical_out_dim
 
     def forward(
         self,
@@ -365,47 +310,20 @@ class BiLSTMAttnLocRegressor(nn.Module):
         coords: Optional[torch.Tensor] = None,
         month: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]:
-        """Forward pass through the model.
-
-        Parameters
-        ----------
-        x : torch.Tensor
-            Tensor of shape ``[B, T, F]`` containing the time‑series input.
-        coords : Optional[torch.Tensor], default=None
-            Optional tensor of shape ``[B, 2]`` with (lat, lon) per sample.
-        month : Optional[torch.Tensor], default=None
-            Optional tensor of shape ``[B]`` or ``[B,1]`` with temporal indices.  The
-            interpretation depends on the encoder variant: month (1–12) for
-            ``variant="monthly"`` or day‑of‑year (1–365) for ``variant="doy"``.
-        mask : Optional[torch.Tensor], default=None
-            Optional tensor indicating valid positions in ``x`` (unused in current implementation).
-
-        Returns
-        -------
-        Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]
-            A tuple ``(y_hat, z_hat, attn)`` where ``y_hat`` is the predicted scalar for each
-            sample, ``z_hat`` is the predicted physical simulation vector (or ``None`` if the
-            physical head is disabled), and ``attn`` contains the attention weights over the
-            time dimension.
-        """
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], torch.Tensor]:
         # Sequence branch
         out, (h, _) = self.lstm(x)
         out = self.norm(out)
-        # Build query from the last hidden states
         if self.bidirectional:
             q = torch.cat([h[-2], h[-1]], dim=-1)
         else:
             q = h[-1]
-        # Compute attention‑based context vector
         ctx, attn = self.attn(out, q, mask)
-        # Optionally compute location embedding
         loc_emb: Optional[torch.Tensor] = None
         if self.loc_encoder is not None:
             if coords is None:
                 raise ValueError("coords must be provided when using a location encoder")
             loc_emb = self.loc_encoder(coords, month)
-        # Fuse context and location for the observation head
         if self.fusion_method == 'hadamard' and loc_emb is not None:
             fused = ctx * loc_emb
         elif loc_emb is not None:
@@ -413,8 +331,10 @@ class BiLSTMAttnLocRegressor(nn.Module):
         else:
             fused = ctx
         y_hat = self.head(fused).squeeze(-1)
-        # Predict physical variables if enabled
         z_hat: Optional[torch.Tensor] = None
         if self.physical_head is not None and loc_emb is not None:
             z_hat = self.physical_head(loc_emb)
-        return y_hat, z_hat, attn
+        aux_z_hat: Optional[torch.Tensor] = None
+        if self.aux_physical_head is not None and loc_emb is not None:
+            aux_z_hat = self.aux_physical_head(loc_emb)
+        return y_hat, z_hat, aux_z_hat, attn

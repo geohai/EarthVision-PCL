@@ -1,10 +1,20 @@
-"""Daily time-series dataset with optional geographic and physical targets.
+"""Daily time-series dataset with support for auxiliary physical targets.
 
-This dataset loads daily time-series samples from NumPy files, applies
-feature scaling, and supports returning geographic coordinates, temporal indices
-such as month or day-of-year, and additional physical simulation variables. It
-is an enhancement of the original ``DailyTSDataset`` to support dual targets
-(observation and physical simulation) used in the dual-decoder model.
+This module extends the original ``DailyTSDataset`` used in LOC4PM to
+support an auxiliary physical head in the model.  In addition to the
+observation target ``y`` and optional primary physical variables ``z``
+(e.g. PM2.5 concentrations), the dataset can return a second set of
+physical variables ``z_aux``.  Both ``z`` and ``z_aux`` may be
+standardised using precomputed statistics (mean and standard deviation)
+provided via a configuration dictionary.  When statistics are not
+available for a given variable, the dataset falls back to min/max
+scaling for ``z`` and to the raw values for ``z_aux``.
+
+The dataset also supports returning geographic coordinates (latitude
+and longitude) and temporal indices (month or day-of-year) to enable
+location encoding.  Filters are applied to remove rows with invalid
+targets or missing features, and caching is used to reduce I/O
+overheads.
 """
 
 from __future__ import annotations
@@ -81,16 +91,6 @@ class MinMaxScalerLite:
         return y
 
 
-# ---------------------------------------------------------------------------
-# Additional scaler: RobustScalerLite
-#
-# This scaler uses the median and inter‑quartile range (IQR) to perform
-# robust scaling on targets.  It is particularly useful for variables like
-# PM2.5 concentrations that exhibit strong right‑skew and outliers.  Values
-# are centred around the median and scaled by the IQR, then mapped into a
-# specified range.  See ``RobustScalerLite.transform_y`` for details.
-# ---------------------------------------------------------------------------
-
 class RobustScalerLite:
     """A robust scaler using the median and IQR.
 
@@ -99,31 +99,20 @@ class RobustScalerLite:
     values are linearly mapped into a specified range.  For example, with ``feature_range=(-1, 1)``,
     the first quartile (25th percentile) of the data will map to approximately ``-0.5`` and the third
     quartile (75th percentile) will map to ``0.5``.
-
-    Parameters
-    ----------
-    feature_range: tuple of (low, high)
-        Desired range of transformed data.  Defaults to (-1.0, 1.0).
     """
+
     def __init__(self, feature_range: Tuple[float, float] = (-1.0, 1.0)) -> None:
         self.median: Optional[float] = None
         self.iqr: Optional[float] = None
         self.lo, self.hi = feature_range
 
     def fit_y_chunk(self, y: np.ndarray) -> None:
-        """Update the scaler's median and IQR using a chunk of target values.
-
-        Args
-        ----
-        y: Array of shape [N] or [N,1] containing target values.
-        """
-        # flatten and convert to float
+        """Update the scaler's median and IQR using a chunk of target values."""
         y_flat = y.reshape(-1).astype(float)
         med = float(np.nanmedian(y_flat))
         q1 = float(np.nanpercentile(y_flat, 25))
         q3 = float(np.nanpercentile(y_flat, 75))
         iqr = q3 - q1
-        # avoid zero IQR
         if iqr == 0:
             iqr = 1.0
         if self.median is None:
@@ -135,28 +124,16 @@ class RobustScalerLite:
             self.iqr = (self.iqr + iqr) / 2.0
 
     def transform_y(self, y: np.ndarray) -> np.ndarray:
-        """Scale target values using the robust statistics.
-
-        Values are first centered around the median and scaled by the IQR, then mapped into the
-        specified ``feature_range``.  Note that the lower and upper quartiles map to around
-        ``0.25*(hi - lo) + lo`` and ``0.75*(hi - lo) + lo``, respectively.
-        """
         if self.median is None or self.iqr is None:
             raise RuntimeError("RobustScalerLite must be fitted before calling transform_y")
-        # center and scale by IQR: q1→-0.5, q3→0.5
         z = (y - self.median) / self.iqr
-        # map from [-0.5, 0.5] to [lo, hi]
         return z * (self.hi - self.lo) + (self.hi + self.lo) / 2.0
 
     def inverse_y(self, z: np.ndarray) -> np.ndarray:
         if self.median is None or self.iqr is None:
             raise RuntimeError("RobustScalerLite must be fitted before calling inverse_y")
-        # map back to centred and scaled values
         z0 = (z - (self.hi + self.lo) / 2.0) / (self.hi - self.lo)
         return z0 * self.iqr + self.median
-
-
-# New robust scaler will be appended later via patch
 
 
 def iter_dates(start_date: str, end_date: str) -> List[str]:
@@ -166,7 +143,7 @@ def iter_dates(start_date: str, end_date: str) -> List[str]:
 
 
 def discover_pairs(root: str, dates: List[str], x_prefix: str, y_prefix: str) -> List[Tuple[str, str]]:
-    pairs = []
+    pairs: List[Tuple[str, str]] = []
     for ds in dates:
         yyyy = ds[:4]
         x = os.path.join(root, yyyy, f"{x_prefix}{ds}.npy")
@@ -179,46 +156,50 @@ def discover_pairs(root: str, dates: List[str], x_prefix: str, y_prefix: str) ->
 
 
 class DailyTSDataset(Dataset):
-    """Daily time-series dataset for pollution modeling.
+    """Daily time-series dataset for pollution modeling with auxiliary physical targets.
 
-    This dataset loads daily samples of time-series features and observation
-    targets from NumPy files. Optionally, it can return geographic
-    coordinates, temporal indices (month or day-of-year), and additional physical simulation targets.
+    In addition to the base time-series and observation target ``y``, this
+    dataset can return two sets of physical variables: a primary vector
+    ``z`` (e.g. PM2.5) and an auxiliary vector ``z_aux``.  These vectors are
+    extracted from the last time step of the raw input and can be
+    standardised using precomputed statistics (mean and std).  When
+    statistics are not provided, the primary physical variables ``z`` are
+    optionally scaled using a MinMax scaler, while the auxiliary variables
+    ``z_aux`` are returned without scaling.
     """
 
-    def __init__(self,
-                 root: str,
-                 start_date: str,
-                 end_date: str,
-                 x_prefix: str = 'TS_X_',
-                 y_prefix: str = 'TS_y_',
-                 drop_feature_indices: Optional[List[int]] = None,
-                 filter_y_positive: bool = True,
-                 remove_nan_rows: bool = True,
-                 scaler_range: Tuple[float, float] = (-1.0, 1.0),
-                 scaler_type: str = 'minmax',
-                 prefetch_files: int = 4,
-                 lat_feature_index: Optional[int] = None,
-                 lon_feature_index: Optional[int] = None,
-                 *,
-                 return_coords: bool = False,
-                 return_month: bool = False,
-                 time_variant: str = 'monthly',
-                 z_feature_indices: Optional[List[int]] = None,
-                 z_scaler_range: Optional[Tuple[float, float]] = None,
-                 ncar_path: Optional[str] = None) -> None:
-        """Instantiate the daily dataset.
-
-        Parameters
-        ----------
-        return_coords: bool
-            Whether to return (lat, lon) coordinates for each sample.
-        return_month: bool
-            If True, return a temporal index (month or day-of-year) for each sample.
-        time_variant: str
-            Determines how the temporal index is interpreted.  ``'monthly'`` returns
-            month indices (1-12); ``'doy'`` returns day-of-year indices (1-365/366).
-        """
+    def __init__(
+        self,
+        root: str,
+        start_date: str,
+        end_date: str,
+        x_prefix: str = 'TS_X_',
+        y_prefix: str = 'TS_y_',
+        drop_feature_indices: Optional[List[int]] = None,
+        filter_y_positive: bool = True,
+        remove_nan_rows: bool = True,
+        scaler_range: Tuple[float, float] = (-1.0, 1.0),
+        scaler_type: str = 'minmax',
+        prefetch_files: int = 4,
+        lat_feature_index: Optional[int] = None,
+        lon_feature_index: Optional[int] = None,
+        *,
+        return_coords: bool = False,
+        return_month: bool = False,
+        time_variant: str = 'monthly',
+        # indices for primary physical variables (e.g. PM25_TOT)
+        z_feature_indices: Optional[List[int]] = None,
+        # indices for auxiliary physical variables
+        z_aux_feature_indices: Optional[List[int]] = None,
+        # optional names for primary and auxiliary physical variables; used with z_stats
+        z_feature_names: Optional[List[str]] = None,
+        z_aux_feature_names: Optional[List[str]] = None,
+        # dictionary of statistics {var_name: {"mean": x, "std": y}}
+        z_stats: Optional[Dict[str, Dict[str, float]]] = None,
+        # optional range for minmax scaling of z if stats not provided
+        z_scaler_range: Optional[Tuple[float, float]] = None,
+        ncar_path: Optional[str] = None,
+    ) -> None:
         super().__init__()
         self.root = root
         self.dates = iter_dates(start_date, end_date)
@@ -232,18 +213,8 @@ class DailyTSDataset(Dataset):
 
         # Flags controlling auxiliary outputs
         self.return_coords = bool(return_coords)
-        # ``return_month`` indicates whether a temporal index (month or day-of-year)
-        # should be returned.  The interpretation of the index is controlled by
-        # ``time_variant`` (see below).  We keep the original name for backwards
-        # compatibility.
         self.return_month = bool(return_month)
-        # Determine how to interpret temporal indices.  If ``time_variant`` is
-        # 'doy', day-of-year indices (1-365/366) will be used; otherwise month
-        # indices (1-12) are used.
-        # Interpret the requested temporal variant.  Any string containing
-        # ``"doy"`` (case insensitive) will enable day‑of‑year indices, while
-        # strings containing ``"month"`` or ``"monthly"`` enable month
-        # indices.  Otherwise, default to months.
+        # Determine temporal variant (monthly vs day-of-year)
         tv = str(time_variant or 'monthly').lower()
         self.time_variant = tv
         if 'doy' in tv:
@@ -253,47 +224,53 @@ class DailyTSDataset(Dataset):
             self.use_month = True
             self.use_doy = False
         else:
-            # default to month if unspecified
             self.use_month = True
             self.use_doy = False
-        self.z_feature_indices = list(z_feature_indices or [])
-        self.return_z = len(self.z_feature_indices) > 0
 
-        # Update the module-level default variant for NCAR sampling.  This allows
-        # ``sample_ncar_points`` to return day-of-year indices when the dataset
-        # was created with ``time_variant='doy'`` but the caller does not
-        # explicitly pass a ``time_variant``.  Without this, NCAR sampling
-        # during training would always default to months.
+        # Primary and auxiliary physical variable indices
+        self.z_feature_indices = list(z_feature_indices or [])
+        self.z_aux_feature_indices = list(z_aux_feature_indices or [])
+        self.return_z = len(self.z_feature_indices) > 0
+        self.return_z_aux = len(self.z_aux_feature_indices) > 0
+
+        # Names and stats for physical variables
+        self.z_feature_names = list(z_feature_names or [])
+        self.z_aux_feature_names = list(z_aux_feature_names or [])
+        self.z_stats: Dict[str, Dict[str, float]] = z_stats or {}
+
+        # Mapping for NCAR sampling (set by dataset init)
         global _DEFAULT_TIME_VARIANT
         _DEFAULT_TIME_VARIANT = self.time_variant
+
+        # Placeholder lists for mapping indices to physical stats arrays
+        self.z_mean: Optional[np.ndarray] = None
+        self.z_std: Optional[np.ndarray] = None
+        self.z_aux_mean: Optional[np.ndarray] = None
+        self.z_aux_std: Optional[np.ndarray] = None
 
         self.keep_feat_idx: Optional[List[int]] = None
         self.file_meta: List[Dict] = []
         x_scaler = MinMaxScalerLite(feature_range=scaler_range)
-        # Choose target scaler based on requested type; robust scaling can better handle right-skewed PM2.5
+        # Choose target scaler based on requested type
         scaler_type_lower = (scaler_type or 'minmax').lower()
         if scaler_type_lower == 'robust':
             y_scaler = RobustScalerLite(feature_range=scaler_range)
         else:
             y_scaler = MinMaxScalerLite(feature_range=scaler_range)
-        # Use separate scaler for z if provided; fallback to same range
+        # Use separate scaler for z if stats are not provided; otherwise scaling will be via z_stats
         z_range = z_scaler_range if z_scaler_range is not None else scaler_range
-        z_scaler = MinMaxScalerLite(feature_range=z_range) if self.return_z else None
+        z_scaler = MinMaxScalerLite(feature_range=z_range) if (self.return_z and not self.z_stats) else None
 
-        # Optionally pre-fit the z scaler on the full NCAR PM25_TOT distribution.
-        # This uses all values from the parquet files (via ``load_ncar_grid``)
-        # instead of only the EO rows present in this dataset.
+        # Optional pre-fit on NCAR for z_scaler (only when z_stats not provided)
         self._z_prefit_on_ncar = False
         if self.return_z and z_scaler is not None and ncar_path:
             try:
                 # load_ncar_grid and _NCAR_CACHE are defined later in this module
                 load_ncar_grid(ncar_path)
                 if 'z' in _NCAR_CACHE:
-                    # _NCAR_CACHE['z'] is df_all['PM25_TOT'].to_numpy(...)
                     z_scaler.fit_y_chunk(_NCAR_CACHE['z'])
                     self._z_prefit_on_ncar = True
             except Exception:
-                # If anything goes wrong, we fall back to fitting on EO samples below.
                 self._z_prefit_on_ncar = False
 
         index_map: List[Tuple[int, int]] = []
@@ -328,27 +305,21 @@ class DailyTSDataset(Dataset):
             if valid_idx.size:
                 x_scaler.fit_x_chunk(Xk[valid_idx])
                 y_scaler.fit_y_chunk(y[valid_idx])
-                # Fit z scaler on valid rows only if we did NOT already pre-fit on NCAR.
+                # Fit z scaler on valid rows if using MinMax and not pre-fitted on NCAR
                 if self.return_z and z_scaler is not None and not self._z_prefit_on_ncar:
-                    # Extract z_chunk from raw X for all time steps to capture variability, shape [N,T,len(z)]
                     z_chunk = X[valid_idx][:, :, self.z_feature_indices]
-                    # For scaling, treat z as features with a dummy time dimension
                     z_scaler.fit_x_chunk(z_chunk)
             # Populate index map and auxiliary metadata
             for rid in valid_idx:
                 index_map.append((fid, int(rid)))
                 coords_list.append((float(latvec[rid]), float(lonvec[rid])))
-                # compute the temporal index corresponding to this file/date
                 try:
                     date_str = self.dates[fid]
                     if self.use_doy:
-                        # Use pandas to compute day-of-year; fallback to 1 if parsing fails
                         t_idx = int(pd.to_datetime(date_str, format=DATE_FMT, errors='coerce').dayofyear)
-                        # pandas returns NaN if parsing fails; treat as invalid
                         if np.isnan(t_idx):
                             raise ValueError("Invalid date")
                     else:
-                        # month (1-12)
                         t_idx = int(date_str.split("-")[1])
                 except Exception:
                     t_idx = 1
@@ -367,6 +338,42 @@ class DailyTSDataset(Dataset):
         self.index_map = index_map
         self.coords = np.asarray(coords_list, dtype=float)  # shape [M,2]
         self.months = np.asarray(months_list, dtype=int)
+
+        # Precompute mean/std arrays for physical variables when statistics are provided
+        if self.z_stats:
+            if self.return_z and (self.z_feature_names or list(self.z_stats.keys())):
+                means, stds = [], []
+                # Use provided names to lookup means/stds.  Fall back to all stats in order.
+                names = self.z_feature_names or list(self.z_stats.keys())[: len(self.z_feature_indices)]
+                for nm in names:
+                    st = self.z_stats.get(nm, None)
+                    if st is None:
+                        continue
+                    mu = float(st.get('mean', 0.0))
+                    sd = float(st.get('std', 1.0))
+                    if sd == 0:
+                        sd = 1.0
+                    means.append(mu)
+                    stds.append(sd)
+                if means:
+                    self.z_mean = np.array(means, dtype=np.float32)
+                    self.z_std = np.array(stds, dtype=np.float32)
+            if self.return_z_aux and (self.z_aux_feature_names or list(self.z_stats.keys())):
+                a_means, a_stds = [], []
+                names = self.z_aux_feature_names or list(self.z_stats.keys())[-len(self.z_aux_feature_indices):]
+                for nm in names:
+                    st = self.z_stats.get(nm, None)
+                    if st is None:
+                        continue
+                    mu = float(st.get('mean', 0.0))
+                    sd = float(st.get('std', 1.0))
+                    if sd == 0:
+                        sd = 1.0
+                    a_means.append(mu)
+                    a_stds.append(sd)
+                if a_means:
+                    self.z_aux_mean = np.array(a_means, dtype=np.float32)
+                    self.z_aux_std = np.array(a_stds, dtype=np.float32)
 
         # Cache loaded arrays to reduce I/O overhead
         self._cache: Dict[str, np.ndarray] = {}
@@ -404,47 +411,37 @@ class DailyTSDataset(Dataset):
             out.append(self.coords[idx].astype(np.float32))
         if self.return_month:
             out.append(self.months[idx].astype(np.int64))
-        # Append scaled physical variables if requested
+        # Append primary physical variables (z)
         if self.return_z:
-            # Extract raw z values from the first time step of the raw X array
             z_raw = X[rid, -1, self.z_feature_indices].astype(np.float32)
-            # Scale z using z_scaler (element-wise). z_scaler.min/max may be arrays or scalars
-            z_row = self.z_scaler.transform_x(z_raw[None, None, :]).reshape(-1)  # [Z]
-            z_row = z_row.astype(np.float32)
+            if self.z_mean is not None and self.z_std is not None:
+                z_row = (z_raw - self.z_mean) / self.z_std
+            elif self.z_scaler is not None:
+                z_row = self.z_scaler.transform_x(z_raw[None, None, :]).reshape(-1)
+            else:
+                z_row = z_raw
             out.append(z_row.astype(np.float32))
+        # Append auxiliary physical variables (z_aux)
+        if self.return_z_aux:
+            z_aux_raw = X[rid, -1, self.z_aux_feature_indices].astype(np.float32)
+            if self.z_aux_mean is not None and self.z_aux_std is not None:
+                z_aux_row = (z_aux_raw - self.z_aux_mean) / self.z_aux_std
+            else:
+                z_aux_row = z_aux_raw
+            out.append(z_aux_row.astype(np.float32))
         out.append(y_row)
         return tuple(out)
 
+
 # ---------------------------------------------------------------------------
-# NCAR grid loading and random sampling
-#
-# The following functions provide a lightweight interface for loading NCAR
-# reanalysis parquet files and sampling random latitude/longitude points
-# uniformly within each grid cell.  They are intended to be used in
-# ``train.py`` when augmenting training batches with synthetic samples.
-
+# NCAR grid loading and random sampling (unchanged from original)
+# These functions are reproduced here to make the dataset self‑contained.
 _NCAR_CACHE: Dict[str, np.ndarray] = {}
-
-# Global default temporal variant used by ``sample_ncar_points`` when no explicit
-# ``time_variant`` argument is provided.  This value is updated in
-# ``DailyTSDataset.__init__`` based on the ``time_variant`` passed to the
-# dataset constructor.  If no dataset has been instantiated, it defaults
-# to 'monthly'.
 _DEFAULT_TIME_VARIANT: str = 'monthly'
 
-
 def load_ncar_grid(ncar_path: str) -> None:
-    """Load NCAR parquet files and cache arrays for random sampling.
-
-    This function reads all ``*.parquet`` files under ``ncar_path`` and
-    extracts the minimum and maximum latitudes and longitudes for each
-    grid cell, the PM25_TOT target and both month and day-of-year indices
-    derived from the ``date`` column.  The resulting arrays are stored in a
-    module-level cache so that subsequent calls to ``sample_ncar_points``
-    can reuse them without reloading the parquet files.
-    """
     if 'lat_min' in _NCAR_CACHE:
-        return  # already loaded
+        return
     files = sorted([os.path.join(ncar_path, f) for f in os.listdir(ncar_path) if f.endswith('.parquet')])
     dfs: List[pd.DataFrame] = []
     required = {
@@ -479,28 +476,7 @@ def load_ncar_grid(ncar_path: str) -> None:
     _NCAR_CACHE['month'] = months
     _NCAR_CACHE['doy'] = doys
 
-
 def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Sample random NCAR points uniformly within grid cells.
-
-    Parameters
-    ----------
-    num_samples: int
-        Number of random points to sample.  If zero or the NCAR cache is
-        empty, returns empty arrays.
-    time_variant: str
-        Either 'monthly' or 'doy'.  Determines whether month (1-12) or day-of-year
-        (1-365/366) indices are returned for the sampled points.
-
-    Returns
-    -------
-    coords : ndarray of shape [N,2]
-        Sampled latitude/longitude coordinates (lat, lon).
-    time_vals : ndarray of shape [N]
-        Temporal indices corresponding to the sampled points.
-    z_vals : ndarray of shape [N]
-        Physical target values (PM25_TOT) for the sampled points.
-    """
     if num_samples <= 0 or 'lat_min' not in _NCAR_CACHE:
         return (
             np.zeros((0, 2), dtype=float),
@@ -514,7 +490,6 @@ def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> 
     z_vals_full = _NCAR_CACHE['z']
     months_full = _NCAR_CACHE['month']
     doys_full = _NCAR_CACHE.get('doy', months_full)
-    # Randomly select rows
     idxs = np.random.randint(0, len(lat_min), size=int(num_samples))
     lat_low = lat_min[idxs]
     lat_hi = lat_max[idxs]
@@ -523,12 +498,7 @@ def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> 
     lats = lat_low + np.random.rand(int(num_samples)) * (lat_hi - lat_low)
     lons = lon_low + np.random.rand(int(num_samples)) * (lon_hi - lon_low)
     coords = np.stack([lats, lons], axis=1)
-    # Choose the appropriate temporal indices based on time_variant.  If none
-    # provided, fall back to the module-level default set by
-    # ``DailyTSDataset.__init__``.
     variant = str(time_variant or _DEFAULT_TIME_VARIANT or 'monthly').lower()
-    # Interpret any variant containing "doy" as a day‑of‑year selection; otherwise
-    # default to months.  This accommodates variants like "doy-hadamard".
     if 'doy' in variant:
         time_full = doys_full
     else:
