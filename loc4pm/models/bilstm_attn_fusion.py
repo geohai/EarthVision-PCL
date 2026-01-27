@@ -99,6 +99,7 @@ class LocationEncoderWrapper(nn.Module):
                         self.encoder = SatClip.from_pretrained(model_name)
                     else:
                         self.encoder = SatClip()
+                    # self.encoder = self.encoder.to(dtype=torch.float32)
                     encoder_loaded = True
                 elif lname in ('siren', 'resiren'):
                     # rshf‑style composition: Direct -> SIREN with optional temporal variant
@@ -226,7 +227,12 @@ class LocationEncoderWrapper(nn.Module):
         elif lname == 'satclip':
             # SatCLIP expects [lon, lat]
             xy = torch.stack([coords[:, 1], coords[:, 0]], dim=1)
+            xy = xy.double()
             out = self.encoder(xy)
+            out = out.float()
+            # Run SatCLIP in fp32 even if the rest of training uses AMP
+            # with torch.autocast(device_type=xy.device.type, enabled=False):
+            #     out = self.encoder(xy)
         elif lname in ('siren', 'resiren'):
             # For local encoders we delegate handling of the temporal index
             out = self.encoder(coords, month)
@@ -243,6 +249,8 @@ class LocationEncoderWrapper(nn.Module):
         if self.proj is not None:
             out = self.proj(out)
         # Normalize
+        # print("out dtype:", out.dtype)
+        # print("norm weight dtype:", self.norm.weight.dtype)
         out = self.norm(out)
         return out
 

@@ -1094,6 +1094,7 @@ def run(cfg_path: str, overrides=None):
                 sched.step()
 
     # ------------------------------ export --------------------------------- #
+    # Export validation predictions if available and requested
     if val_loader is not None and cfg['eval']['save_val_predictions']:
         out_csv = cfg['eval']['out_csv_val']
         mets_json = os.path.splitext(out_csv)[0] + '.metrics.json'
@@ -1108,9 +1109,23 @@ def run(cfg_path: str, overrides=None):
             return_z=(physical_out_dim > 0),
             loss_weight_physical=loss_weight_physical,
         )
-        mets = save_predictions_and_metrics(y_true_val, y_pred_val, ysc_path, out_csv, mets_json)
+        # Extract latitudes, longitudes and dates for the validation indices.  These are needed for residual analysis.
+        # Coordinates are stored in ds.coords and dates can be looked up via ds.dates and index_map.
+        if val_idx.size > 0:
+            # lat/lon arrays correspond to the order of val_idx used by DataLoader
+            latlon_val = ds.coords[val_idx]
+            lats_val = latlon_val[:, 0]
+            lons_val = latlon_val[:, 1]
+            # Derive date strings from the file index (fid) in ds.index_map
+            dates_val = [ds.dates[ds.index_map[int(idx)][0]] for idx in val_idx]
+        else:
+            lats_val = None
+            lons_val = None
+            dates_val = None
+        mets = save_predictions_and_metrics(y_true_val, y_pred_val, ysc_path, out_csv, mets_json, lat=lats_val, lon=lons_val, dates=dates_val)
         logging.info("Validation metrics:\n%s", json.dumps(mets, indent=2))
 
+    # Export test predictions if there is a test split
     if test_idx.size > 0:
         test_loader = DataLoader(
             Subset(ds, test_idx),
@@ -1133,7 +1148,12 @@ def run(cfg_path: str, overrides=None):
         out_csv_t = cfg['eval']['out_csv_test']
         mets_json_t = os.path.splitext(out_csv_t)[0] + '.metrics.json'
         ysc_path = os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib')
-        tmets = save_predictions_and_metrics(y_true_t, y_pred_t, ysc_path, out_csv_t, mets_json_t)
+        # Extract latitudes, longitudes and dates for the test indices.
+        latlon_test = ds.coords[test_idx]
+        lats_test = latlon_test[:, 0]
+        lons_test = latlon_test[:, 1]
+        dates_test = [ds.dates[ds.index_map[int(idx)][0]] for idx in test_idx]
+        tmets = save_predictions_and_metrics(y_true_t, y_pred_t, ysc_path, out_csv_t, mets_json_t, lat=lats_test, lon=lons_test, dates=dates_test)
         logging.info("Test metrics:\n%s", json.dumps(tmets, indent=2))
 
     if writer:
