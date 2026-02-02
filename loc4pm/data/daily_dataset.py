@@ -1,20 +1,17 @@
-"""Daily time-series dataset with support for auxiliary physical targets.
+"""
+Daily time-series dataset with support for auxiliary physical targets and
+z‑score standardisation.
 
 This module extends the original ``DailyTSDataset`` used in LOC4PM to
-support an auxiliary physical head in the model.  In addition to the
-observation target ``y`` and optional primary physical variables ``z``
-(e.g. PM2.5 concentrations), the dataset can return a second set of
-physical variables ``z_aux``.  Both ``z`` and ``z_aux`` may be
-standardised using precomputed statistics (mean and standard deviation)
-provided via a configuration dictionary.  When statistics are not
-available for a given variable, the dataset falls back to min/max
-scaling for ``z`` and to the raw values for ``z_aux``.
-
-The dataset also supports returning geographic coordinates (latitude
-and longitude) and temporal indices (month or day-of-year) to enable
-location encoding.  Filters are applied to remove rows with invalid
-targets or missing features, and caching is used to reduce I/O
-overheads.
+support an auxiliary physical head in the model and to normalise the
+observation target ``y`` via z‑score.  In addition to the base
+time‑series features and optional coordinate/time indices, the dataset
+returns primary physical variables ``z`` (e.g. PM2.5), auxiliary
+physical variables ``z_aux`` (e.g. meteorological conditions), and the
+standardised observation ``y``.  When precomputed statistics are
+provided for any of these variables, they are used for z‑score
+standardisation; otherwise the dataset falls back to the configured
+min/max or robust scalers.
 """
 
 from __future__ import annotations
@@ -33,7 +30,7 @@ class MinMaxScalerLite:
     """A lightweight MinMax scaler for 1-D or multi-dimensional arrays.
 
     This scaler computes per-feature minima and maxima and applies a linear
-    transformation to map values into a specified range. It can operate on
+    transformation to map values into a specified range.  It can operate on
     both time-series features (shape [N, T, F]) and single targets (shape
     [N, F] or [N, 1]).
     """
@@ -94,8 +91,8 @@ class MinMaxScalerLite:
 class RobustScalerLite:
     """A robust scaler using the median and IQR.
 
-    This scaler scales targets based on their median and inter‑quartile range (IQR), which makes it more
-    robust to outliers and right‑skewed distributions compared to a simple min/max scaler.  The scaled
+    This scaler scales targets based on their median and inter‑quartile range (IQR), which makes it
+    more robust to outliers and right‑skewed distributions compared to a simple min/max scaler.  The scaled
     values are linearly mapped into a specified range.  For example, with ``feature_range=(-1, 1)``,
     the first quartile (25th percentile) of the data will map to approximately ``-0.5`` and the third
     quartile (75th percentile) will map to ``0.5``.
@@ -136,6 +133,28 @@ class RobustScalerLite:
         return z0 * self.iqr + self.median
 
 
+class ZScoreScalerLite:
+    """Simple z‑score scaler for targets.
+
+    This scaler applies ``(y - mean) / std`` to normalise the target variable.  When ``std`` is zero,
+    it defaults to one to avoid division by zero.  The scaler also provides an ``inverse_y`` method
+    to recover the original units.
+    """
+    def __init__(self, mean: float, std: float) -> None:
+        self.mean = float(mean)
+        self.std = float(std) if float(std) != 0.0 else 1.0
+
+    def fit_y_chunk(self, y: np.ndarray) -> None:
+        # no fitting needed for z‑score with precomputed stats
+        pass
+
+    def transform_y(self, y: np.ndarray) -> np.ndarray:
+        return (y - self.mean) / self.std
+
+    def inverse_y(self, z: np.ndarray) -> np.ndarray:
+        return z * self.std + self.mean
+
+
 def iter_dates(start_date: str, end_date: str) -> List[str]:
     d0 = pd.to_datetime(start_date)
     d1 = pd.to_datetime(end_date)
@@ -156,7 +175,7 @@ def discover_pairs(root: str, dates: List[str], x_prefix: str, y_prefix: str) ->
 
 
 class DailyTSDataset(Dataset):
-    """Daily time-series dataset for pollution modeling with auxiliary physical targets.
+    """Daily time-series dataset for pollution modelling with auxiliary physical targets.
 
     In addition to the base time-series and observation target ``y``, this
     dataset can return two sets of physical variables: a primary vector
@@ -165,7 +184,9 @@ class DailyTSDataset(Dataset):
     standardised using precomputed statistics (mean and std).  When
     statistics are not provided, the primary physical variables ``z`` are
     optionally scaled using a MinMax scaler, while the auxiliary variables
-    ``z_aux`` are returned without scaling.
+    ``z_aux`` are returned without scaling.  The observation target ``y``
+    can be scaled via min/max, robust, or z‑score depending on
+    configuration.
     """
 
     def __init__(
@@ -198,6 +219,8 @@ class DailyTSDataset(Dataset):
         z_stats: Optional[Dict[str, Dict[str, float]]] = None,
         # optional range for minmax scaling of z if stats not provided
         z_scaler_range: Optional[Tuple[float, float]] = None,
+        # optional statistics for y (mean and std) for z‑score scaling
+        y_stats: Optional[Dict[str, float]] = None,
         ncar_path: Optional[str] = None,
     ) -> None:
         super().__init__()
@@ -238,6 +261,9 @@ class DailyTSDataset(Dataset):
         self.z_aux_feature_names = list(z_aux_feature_names or [])
         self.z_stats: Dict[str, Dict[str, float]] = z_stats or {}
 
+        # Statistics for y (for z‑score scaling)
+        self.y_stats = y_stats or {}
+
         # Mapping for NCAR sampling (set by dataset init)
         global _DEFAULT_TIME_VARIANT
         _DEFAULT_TIME_VARIANT = self.time_variant
@@ -250,11 +276,20 @@ class DailyTSDataset(Dataset):
 
         self.keep_feat_idx: Optional[List[int]] = None
         self.file_meta: List[Dict] = []
+
+        # Scalers for features and targets
         x_scaler = MinMaxScalerLite(feature_range=scaler_range)
         # Choose target scaler based on requested type
         scaler_type_lower = (scaler_type or 'minmax').lower()
         if scaler_type_lower == 'robust':
             y_scaler = RobustScalerLite(feature_range=scaler_range)
+        elif scaler_type_lower == 'zscore' or self.y_stats:
+            # Use z‑score scaler for y when requested or when explicit stats provided
+            mean = float(self.y_stats.get('mean', 0.0))
+            std = float(self.y_stats.get('std', 1.0))
+            if std == 0:
+                std = 1.0
+            y_scaler = ZScoreScalerLite(mean=mean, std=std)
         else:
             y_scaler = MinMaxScalerLite(feature_range=scaler_range)
         # Use separate scaler for z if stats are not provided; otherwise scaling will be via z_stats
@@ -304,7 +339,9 @@ class DailyTSDataset(Dataset):
             valid_idx = np.where(m)[0]
             if valid_idx.size:
                 x_scaler.fit_x_chunk(Xk[valid_idx])
-                y_scaler.fit_y_chunk(y[valid_idx])
+                # For z‑score scaling of y, no fitting needed; otherwise fit minmax/robust
+                if not isinstance(y_scaler, ZScoreScalerLite):
+                    y_scaler.fit_y_chunk(y[valid_idx])
                 # Fit z scaler on valid rows if using MinMax and not pre-fitted on NCAR
                 if self.return_z and z_scaler is not None and not self._z_prefit_on_ncar:
                     z_chunk = X[valid_idx][:, :, self.z_feature_indices]
@@ -404,6 +441,7 @@ class DailyTSDataset(Dataset):
         x_row = X[rid][:, self.keep_feat_idx]
         y_row = y[rid].astype(np.float32)
         x_row = self.x_scaler.transform_x(x_row).astype(np.float32)
+        # y_scaler may be ZScoreScalerLite or MinMax/Robust
         y_row = self.y_scaler.transform_y(y_row).astype(np.float32)
         # Build output tuple dynamically
         out: List[np.ndarray | float | int] = [x_row]
@@ -438,6 +476,7 @@ class DailyTSDataset(Dataset):
 # These functions are reproduced here to make the dataset self‑contained.
 _NCAR_CACHE: Dict[str, np.ndarray] = {}
 _DEFAULT_TIME_VARIANT: str = 'monthly'
+
 
 def load_ncar_grid(ncar_path: str) -> None:
     if 'lat_min' in _NCAR_CACHE:
@@ -475,6 +514,7 @@ def load_ncar_grid(ncar_path: str) -> None:
         doys = np.ones(len(df_all), dtype=int)
     _NCAR_CACHE['month'] = months
     _NCAR_CACHE['doy'] = doys
+
 
 def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     if num_samples <= 0 or 'lat_min' not in _NCAR_CACHE:

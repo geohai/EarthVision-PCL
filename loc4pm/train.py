@@ -12,8 +12,10 @@ from supervised and unsupervised data.  When auxiliary physical targets are
 enabled (via ``data.z_aux_feature_indices``), the model predicts both the
 primary physical variables (e.g. PM2.5) and the auxiliary variables
 (e.g. air density, relative humidity).  The training and evaluation loops
-compute physical losses for both heads and average them to form the
-regularization term.
+compute physical losses for both heads separately; each can be assigned its
+own weight (``loss_weight_physical`` for the primary head and
+``loss_weight_physical_aux`` for the auxiliary head).  Both losses are
+logged independently to facilitate monitoring and tuning.
 """
 
 from __future__ import annotations
@@ -39,6 +41,11 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 
+# Import dataset and model components.  DailyTSDataset now supports
+# z‑score scaling for the observation target ``y`` when statistics are
+# provided via ``y_stats``.  The models optionally expose both
+# ``physical_head`` and ``aux_physical_head`` for primary and auxiliary
+# physical variables respectively.
 from .data.daily_dataset import DailyTSDataset, load_ncar_grid as _load_ncar_grid_ds, sample_ncar_points as _sample_ncar_points_ds
 from .models.bilstm_attn import BiLSTMAttnRegressor
 from .models.bilstm_attn_fusion import BiLSTMAttnLocRegressor
@@ -201,32 +208,6 @@ def _expand_cfg_strings(cfg: dict) -> None:
                 cfg['eval'][k] = _expand_placeholders(cfg['eval'][k], cfg)
 
 
-def _expand_placeholders(s: str, cfg: dict) -> str:
-    if not isinstance(s, str):
-        return s
-    pat = re.compile(r"\$\{([^}]+)\}")
-    def repl(m):
-        key = m.group(1)
-        try:
-            return str(_deep_get(cfg, key))
-        except Exception:
-            return m.group(0)
-    return pat.sub(repl, s)
-
-
-def _expand_cfg_strings(cfg: dict) -> None:
-    if 'logging' in cfg and 'run_name' in cfg['logging']:
-        cfg['logging']['run_name'] = _expand_placeholders(cfg['logging']['run_name'], cfg)
-    if 'logging' in cfg:
-        for k in ('epoch_csv', 'step_csv'):
-            if k in cfg['logging']:
-                cfg['logging'][k] = _expand_placeholders(cfg['logging'][k], cfg)
-    if 'eval' in cfg:
-        for k in ('out_csv_val', 'out_csv_test'):
-            if k in cfg['eval']:
-                cfg['eval'][k] = _expand_placeholders(cfg['eval'][k], cfg)
-
-
 def _parse_overrides(pairs):
     def cast(v):
         if isinstance(v, str):
@@ -297,6 +278,9 @@ def make_dataset(cfg):
     z_scaler_range = tuple(data_cfg.get('z_scaler_range', data_cfg.get('scaler_range', (-1.0, 1.0))))
     ncar_path = data_cfg.get('ncar_grid_path', None)
 
+    # Additional statistics for y (observation target) to enable z‑score scaling
+    y_stats = data_cfg.get('y_stats', None)
+
     ds = DailyTSDataset(
         root=data_cfg['root'],
         start_date=data_cfg['start_date'],
@@ -321,6 +305,7 @@ def make_dataset(cfg):
         z_stats=z_stats,
         z_scaler_range=z_scaler_range,
         scaler_type=data_cfg.get('scaler_type', 'minmax'),
+        y_stats=y_stats,
         ncar_path=ncar_path,
     )
 
@@ -536,50 +521,66 @@ def evaluate(
     return_z: bool = False,
     return_z_aux: bool = False,
     loss_weight_physical: float = 0.0,
+    loss_weight_physical_aux: float = 0.0,
 ):
-    """Evaluate with component losses: returns (mean_total, mean_pred, mean_phys, y_pred, y_true).
+    """Evaluate with component losses.
 
-    When both primary and auxiliary physical heads are enabled, the physical loss
-    is computed for each head and averaged before being multiplied by the
-    loss weight.  The returned ``mean_phys`` is the mean of the unweighted
-    physical losses across all batches.
+    Returns a tuple ``(mean_total, mean_pred, mean_phys_main, mean_phys_aux, y_pred, y_true)``.
+    The total loss includes weighted physical contributions as
+    ``loss_weight_physical * phys_main + loss_weight_physical_aux * phys_aux``.
+    The returned ``mean_phys_main`` and ``mean_phys_aux`` are the mean of the unweighted
+    physical losses across all batches (i.e. before multiplying by the weights).
     """
     model.eval()
-    tot_losses, pred_losses, phys_losses = [], [], []
+    tot_losses, pred_losses, phys_main_losses, phys_aux_losses = [], [], [], []
     y_pred_list, y_true_list = [], []
     with torch.no_grad():
         for batch in loader:
             x, coords, month_t, z, z_aux, y = _parse_batch(batch, use_location, return_month, expect_z=return_z, expect_z_aux=return_z_aux)
             x = x.to(device)
-            y = y.to(device).squeeze(-1)
+            # y has shape [B,1]; squeeze to [B]
+            y = y.to(device)
+            if y.ndim > 1 and y.shape[-1] == 1:
+                y = y.squeeze(-1)
             coords = coords.to(device) if coords is not None else None
             month_t = month_t.to(device) if month_t is not None else None
             z = z.to(device) if z is not None else None
             z_aux = z_aux.to(device) if z_aux is not None else None
             out = model(x, coords, month_t) if use_location else model(x)
             yhat, zhat, zhat_aux, _ = _split_model_outputs(out)
+            # Flatten prediction shapes: [B,1] -> [B]
+            if yhat is not None and yhat.ndim > 1 and yhat.shape[-1] == 1:
+                yhat = yhat.squeeze(-1)
+            if zhat is not None and zhat.ndim > 1 and zhat.shape[-1] == 1:
+                zhat = zhat.squeeze(-1)
+            if z is not None and z.ndim > 1 and z.shape[-1] == 1:
+                z = z.squeeze(-1)
+            if zhat_aux is not None and zhat_aux.ndim > 1 and zhat_aux.shape[-1] == 1:
+                zhat_aux = zhat_aux.squeeze(-1)
+            if z_aux is not None and z_aux.ndim > 1 and z_aux.shape[-1] == 1:
+                z_aux = z_aux.squeeze(-1)
             pred_loss = loss_fn(yhat, y)
-            phys_loss = torch.tensor(0.0, device=device)
+            # Compute unweighted physical losses
+            phys_main = torch.tensor(0.0, device=device)
+            phys_aux = torch.tensor(0.0, device=device)
             if return_z and zhat is not None and z is not None:
-                # primary physical loss
-                loss_main = loss_fn(zhat, z)
-                if return_z_aux and zhat_aux is not None and z_aux is not None:
-                    # auxiliary physical loss
-                    loss_aux = loss_fn(zhat_aux, z_aux)
-                    phys_loss = (loss_main + loss_aux) / 2.0
-                else:
-                    phys_loss = loss_main
-            # combine losses
-            loss = pred_loss + loss_weight_physical * phys_loss
+                phys_main = loss_fn(zhat, z)
+            if return_z_aux and zhat_aux is not None and z_aux is not None:
+                phys_aux = loss_fn(zhat_aux, z_aux)
+            # Weighted physical loss contribution
+            phys_contrib = loss_weight_physical * phys_main + loss_weight_physical_aux * phys_aux
+            loss = pred_loss + phys_contrib
             tot_losses.append(loss.item())
             pred_losses.append(pred_loss.item())
-            phys_losses.append(float(phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss))
+            phys_main_losses.append(float(phys_main.item()))
+            phys_aux_losses.append(float(phys_aux.item()))
             y_pred_list.append(yhat.detach().cpu().numpy())
             y_true_list.append(y.detach().cpu().numpy())
     mean_total = float(np.mean(tot_losses)) if tot_losses else float('nan')
     mean_pred = float(np.mean(pred_losses)) if pred_losses else float('nan')
-    mean_phys = float(np.mean(phys_losses)) if phys_losses else 0.0
-    return mean_total, mean_pred, mean_phys, np.concatenate(y_pred_list), np.concatenate(y_true_list)
+    mean_phys_main = float(np.mean(phys_main_losses)) if phys_main_losses else 0.0
+    mean_phys_aux = float(np.mean(phys_aux_losses)) if phys_aux_losses else 0.0
+    return mean_total, mean_pred, mean_phys_main, mean_phys_aux, np.concatenate(y_pred_list), np.concatenate(y_true_list)
 
 
 # --------------------------------- run ------------------------------------ #
@@ -685,6 +686,8 @@ def run(cfg_path: str, overrides=None):
     aux_physical_out_dim = len(z_aux_feature_indices)
     # Base weight for physical loss
     loss_weight_physical = float(cfg['train'].get('loss_weight_physical', 0.0))
+    # Separate weight for auxiliary physical loss; default to same as primary if unspecified
+    loss_weight_physical_aux = float(cfg['train'].get('loss_weight_physical_aux', cfg['train'].get('loss_weight_physical', 0.0)))
     # Location / model config
     loc_cfg = cfg.get('model', {}).get('location', {}) or {}
     loc_name = str(loc_cfg.get('name', 'none') or 'none').lower()
@@ -761,9 +764,10 @@ def run(cfg_path: str, overrides=None):
         "ENABLED" if aux_physical_out_dim > 0 else "DISABLED", aux_physical_out_dim,
     )
     log.info(
-        "Loss weight c (physical): %.4f%s",
+        "Loss weight c_main (physical): %.4f | c_aux (physical_aux): %.4f%s",
         loss_weight_physical,
-        "  [diagnostic-only]" if loss_weight_physical == 0.0 and (physical_out_dim > 0 or aux_physical_out_dim > 0) else "",
+        loss_weight_physical_aux,
+        "  [diagnostic-only]" if loss_weight_physical == 0.0 and (physical_out_dim > 0) else "",
     )
     # Parameter counts
     tot, trn, frz = _count_params(model)
@@ -866,7 +870,8 @@ def run(cfg_path: str, overrides=None):
     for epoch in range(1, cfg['train']['epochs'] + 1):
         ep_t0 = time.perf_counter()
         model.train()
-        tr_tot_losses, tr_pred_losses, tr_phys_losses = [], [], []
+        tr_tot_losses, tr_pred_losses = [], []
+        tr_phys_main_losses, tr_phys_aux_losses = [], []
         seen = 0
         rand_total_samples = 0
         expect_z = (physical_out_dim > 0)
@@ -876,7 +881,10 @@ def run(cfg_path: str, overrides=None):
             bs = x.shape[0]
             seen += bs
             x = x.to(device)
-            y = y.to(device).squeeze(-1)
+            # Targets: squeeze last dim if singleton
+            y = y.to(device)
+            if y.ndim > 1 and y.shape[-1] == 1:
+                y = y.squeeze(-1)
             coords = coords.to(device) if coords is not None else None
             month_t = month_t.to(device) if month_t is not None else None
             z = z.to(device) if z is not None else None
@@ -886,28 +894,49 @@ def run(cfg_path: str, overrides=None):
                 with amp_autocast():
                     out = model(x, coords, month_t) if use_location else model(x)
                     yhat, zhat, zhat_aux, _ = _split_model_outputs(out)
+                    # Flatten shapes for 1‑dim outputs
+                    if yhat is not None and yhat.ndim > 1 and yhat.shape[-1] == 1:
+                        yhat = yhat.squeeze(-1)
+                    if zhat is not None and zhat.ndim > 1 and zhat.shape[-1] == 1:
+                        zhat = zhat.squeeze(-1)
+                    if z is not None and z.ndim > 1 and z.shape[-1] == 1:
+                        z = z.squeeze(-1)
+                    if zhat_aux is not None and zhat_aux.ndim > 1 and zhat_aux.shape[-1] == 1:
+                        zhat_aux = zhat_aux.squeeze(-1)
+                    if z_aux is not None and z_aux.ndim > 1 and z_aux.shape[-1] == 1:
+                        z_aux = z_aux.squeeze(-1)
+                    # if epoch == 1:
+                    #     def stats(name, t):
+                    #         t = t.detach().float().view(-1)
+                    #         print(
+                    #             f"{name}: shape={tuple(t.shape)} mean={t.mean().item():.4f} std={t.std(unbiased=False).item():.4f} "
+                    #             f"min={t.min().item():.4f} max={t.max().item():.4f}")
+                    #
+                    #     if z is not None and zhat is not None:
+                    #         stats("z (dataset)", z)
+                    #         stats("zhat (pred)", zhat)
+                    #
+                    #     if 'z_rand' in locals() and z_rand is not None and 'zhat_rand' in locals() and zhat_rand is not None:
+                    #         stats("z_rand (NCAR)", z_rand)
+                    #         stats("zhat_rand (pred)", zhat_rand)
                     pred_loss = loss_fn(yhat, y)
-                    # compute physical loss on dataset samples
-                    phys_loss_ds = torch.tensor(0.0, device=device)
+                    # Compute dataset physical losses (unweighted)
+                    phys_main_ds = torch.tensor(0.0, device=device)
+                    phys_aux_ds = torch.tensor(0.0, device=device)
                     if expect_z and zhat is not None and z is not None:
-                        loss_main = loss_fn(zhat, z)
-                        if expect_z_aux and zhat_aux is not None and z_aux is not None:
-                            loss_aux = loss_fn(zhat_aux, z_aux)
-                            phys_loss_ds = (loss_main + loss_aux) / 2.0
-                        else:
-                            phys_loss_ds = loss_main
-                    # sample additional NCAR points if enabled (only for primary physical)
-                    phys_loss_rand = torch.tensor(0.0, device=device)
+                        phys_main_ds = loss_fn(zhat, z)
+                    if expect_z_aux and zhat_aux is not None and z_aux is not None:
+                        phys_aux_ds = loss_fn(zhat_aux, z_aux)
+                    # Random NCAR samples contribute only to primary physical loss
+                    phys_main_rand = torch.tensor(0.0, device=device)
                     n_rand = 0
                     if ncar_ratio > 0.0 and expect_z:
                         n_rand = int(round(ncar_ratio * bs))
                         rand_total_samples += n_rand
                         if n_rand > 0:
                             coords_rand_np, month_rand_np, z_rand_np = _sample_ncar_points_ds(n_rand)
-                            # standardize random z using dataset stats or scaler
                             if z_rand_np.size > 0:
                                 if z_mean is not None and z_std is not None:
-                                    # z_rand_np may be 1D array of shape [n_rand]
                                     z_rand_np = ((z_rand_np - z_mean) / z_std).astype(np.float32)
                                 elif z_scaler is not None:
                                     z_reshaped = z_rand_np.reshape(-1, 1, 1)
@@ -921,18 +950,24 @@ def run(cfg_path: str, overrides=None):
                                     else None
                                 )
                                 z_rand = torch.tensor(z_rand_np, dtype=torch.float32, device=device)
-                                # obtain location embeddings and primary z predictions
                                 loc_rand_emb = model.loc_encoder(coords_rand, month_rand) if use_location else None
                                 if loc_rand_emb is not None and model.physical_head is not None:
                                     zhat_rand = model.physical_head(loc_rand_emb)
-                                    phys_loss_rand = loss_fn(zhat_rand, z_rand)
-                    # combine physical losses across dataset and random samples
+                                    if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
+                                        zhat_rand = zhat_rand.squeeze(-1)
+                                    phys_main_rand = loss_fn(zhat_rand, z_rand)
+                    # Combine dataset and random contributions for primary physical loss
                     if expect_z and (bs + n_rand) > 0:
-                        total_phys_loss = phys_loss_ds * bs + phys_loss_rand * max(n_rand, 0)
-                        phys_loss = total_phys_loss / float(bs + n_rand)
+                        phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
                     else:
-                        phys_loss = torch.tensor(0.0, device=device)
-                    loss = pred_loss + loss_weight_physical * phys_loss
+                        phys_main = torch.tensor(0.0, device=device)
+                    # Auxiliary physical loss has no random samples
+                    phys_aux = phys_aux_ds
+                    # Weighted physical contributions
+                    weighted_main = loss_weight_physical * phys_main
+                    weighted_aux = loss_weight_physical_aux * phys_aux
+                    phys_contrib = weighted_main + weighted_aux
+                    loss = pred_loss + phys_contrib
                 scaler.scale(loss).backward()
                 if cfg['train'].get('grad_clip_norm') is not None:
                     scaler.unscale_(opt)
@@ -942,16 +977,24 @@ def run(cfg_path: str, overrides=None):
             else:
                 out = model(x, coords, month_t) if use_location else model(x)
                 yhat, zhat, zhat_aux, _ = _split_model_outputs(out)
+                if yhat is not None and yhat.ndim > 1 and yhat.shape[-1] == 1:
+                    yhat = yhat.squeeze(-1)
+                if zhat is not None and zhat.ndim > 1 and zhat.shape[-1] == 1:
+                    zhat = zhat.squeeze(-1)
+                if z is not None and z.ndim > 1 and z.shape[-1] == 1:
+                    z = z.squeeze(-1)
+                if zhat_aux is not None and zhat_aux.ndim > 1 and zhat_aux.shape[-1] == 1:
+                    zhat_aux = zhat_aux.squeeze(-1)
+                if z_aux is not None and z_aux.ndim > 1 and z_aux.shape[-1] == 1:
+                    z_aux = z_aux.squeeze(-1)
                 pred_loss = loss_fn(yhat, y)
-                phys_loss_ds = torch.tensor(0.0, device=device)
+                phys_main_ds = torch.tensor(0.0, device=device)
+                phys_aux_ds = torch.tensor(0.0, device=device)
                 if expect_z and zhat is not None and z is not None:
-                    loss_main = loss_fn(zhat, z)
-                    if expect_z_aux and zhat_aux is not None and z_aux is not None:
-                        loss_aux = loss_fn(zhat_aux, z_aux)
-                        phys_loss_ds = (loss_main + loss_aux) / 2.0
-                    else:
-                        phys_loss_ds = loss_main
-                phys_loss_rand = torch.tensor(0.0, device=device)
+                    phys_main_ds = loss_fn(zhat, z)
+                if expect_z_aux and zhat_aux is not None and z_aux is not None:
+                    phys_aux_ds = loss_fn(zhat_aux, z_aux)
+                phys_main_rand = torch.tensor(0.0, device=device)
                 n_rand = 0
                 if ncar_ratio > 0.0 and expect_z:
                     n_rand = int(round(ncar_ratio * bs))
@@ -976,25 +1019,33 @@ def run(cfg_path: str, overrides=None):
                             loc_rand_emb = model.loc_encoder(coords_rand, month_rand) if use_location else None
                             if loc_rand_emb is not None and model.physical_head is not None:
                                 zhat_rand = model.physical_head(loc_rand_emb)
-                                phys_loss_rand = loss_fn(zhat_rand, z_rand)
+                                if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
+                                    zhat_rand = zhat_rand.squeeze(-1)
+                                phys_main_rand = loss_fn(zhat_rand, z_rand)
                 if expect_z and (bs + n_rand) > 0:
-                    total_phys_loss = phys_loss_ds * bs + phys_loss_rand * max(n_rand, 0)
-                    phys_loss = total_phys_loss / float(bs + n_rand)
+                    phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
                 else:
-                    phys_loss = torch.tensor(0.0, device=device)
-                loss = pred_loss + loss_weight_physical * phys_loss
+                    phys_main = torch.tensor(0.0, device=device)
+                phys_aux = phys_aux_ds
+                weighted_main = loss_weight_physical * phys_main
+                weighted_aux = loss_weight_physical_aux * phys_aux
+                phys_contrib = weighted_main + weighted_aux
+                loss = pred_loss + phys_contrib
                 loss.backward()
                 if cfg['train'].get('grad_clip_norm') is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip_norm'])
                 opt.step()
             tr_tot_losses.append(loss.item())
             tr_pred_losses.append(pred_loss.item())
-            tr_phys_losses.append(float(phys_loss.item() if torch.is_tensor(phys_loss) else phys_loss))
+            tr_phys_main_losses.append(float(phys_main.item() if torch.is_tensor(phys_main) else phys_main))
+            tr_phys_aux_losses.append(float(phys_aux.item() if torch.is_tensor(phys_aux) else phys_aux))
             # TB step logs
             if writer and (i + 1) % cfg['logging']['log_every_steps'] == 0:
-                writer.add_scalar('train/step_total_loss', loss.item(), i + (epoch - 1) * len(train_loader))
-                writer.add_scalar('train/step_pred_loss', pred_loss.item(), i + (epoch - 1) * len(train_loader))
-                writer.add_scalar('train/step_phys_loss', tr_phys_losses[-1], i + (epoch - 1) * len(train_loader))
+                step_global = i + (epoch - 1) * len(train_loader)
+                writer.add_scalar('train/step_total_loss', loss.item(), step_global)
+                writer.add_scalar('train/step_pred_loss', pred_loss.item(), step_global)
+                writer.add_scalar('train/step_phys_main_loss', tr_phys_main_losses[-1], step_global)
+                writer.add_scalar('train/step_phys_aux_loss', tr_phys_aux_losses[-1], step_global)
             # Optional CSV per‑step
             if save_step_csv and ((i + 1) % step_every == 0):
                 _append_csv_row(
@@ -1004,27 +1055,30 @@ def run(cfg_path: str, overrides=None):
                         'step_in_epoch': int(i + 1),
                         'train_total': float(tr_tot_losses[-1]),
                         'train_pred': float(tr_pred_losses[-1]),
-                        'train_phys': float(tr_phys_losses[-1]),
+                        'train_phys_main': float(tr_phys_main_losses[-1]),
+                        'train_phys_aux': float(tr_phys_aux_losses[-1]),
                         'lr': float(opt.param_groups[0]['lr']),
                     },
                 )
         # Compute epoch-level statistics
         tr_total = float(np.mean(tr_tot_losses)) if tr_tot_losses else float('nan')
         tr_pred = float(np.mean(tr_pred_losses)) if tr_pred_losses else float('nan')
-        tr_phys = float(np.mean(tr_phys_losses)) if tr_phys_losses else 0.0
+        tr_phys_main = float(np.mean(tr_phys_main_losses)) if tr_phys_main_losses else 0.0
+        tr_phys_aux = float(np.mean(tr_phys_aux_losses)) if tr_phys_aux_losses else 0.0
+        # Combined weighted physical loss (for logging convenience)
+        tr_phys_comb = loss_weight_physical * tr_phys_main + loss_weight_physical_aux * tr_phys_aux
         ep_sec = time.perf_counter() - ep_t0
         samples_per_sec = seen / ep_sec if ep_sec > 0 else float('nan')
         log.info(
-            f"Epoch {epoch:03d} | train_total={tr_total:.5f} | pred={tr_pred:.5f} | phys={tr_phys:.5f} | "
-            f"lr={opt.param_groups[0]['lr']:.3e} | samples={seen} | rand_samples={rand_total_samples} | "
-            f"{samples_per_sec:.1f} samples/s | duration={ep_sec:.1f}s"
+            f"Epoch {epoch:03d} | train_total={tr_total:.5f} | pred={tr_pred:.5f} | phys_main={tr_phys_main:.5f} | phys_aux={tr_phys_aux:.5f} | lr={opt.param_groups[0]['lr']:.3e} | samples={seen} | rand_samples={rand_total_samples} | {samples_per_sec:.1f} samples/s | duration={ep_sec:.1f}s"
         )
         if writer:
             writer.add_scalar('train/epoch_total_loss', tr_total, epoch)
             writer.add_scalar('train/epoch_pred_loss', tr_pred, epoch)
-            writer.add_scalar('train/epoch_phys_loss', tr_phys, epoch)
+            writer.add_scalar('train/epoch_phys_main_loss', tr_phys_main, epoch)
+            writer.add_scalar('train/epoch_phys_aux_loss', tr_phys_aux, epoch)
             writer.add_scalar('opt/lr', opt.param_groups[0]['lr'], epoch)
-        # Dynamic loss weight update
+        # Dynamic loss weight update (only applied to main physical head)
         if dwa_enabled:
             if prev_pred_loss_epoch is not None and prev_prev_pred_loss_epoch is not None and prev_phys_loss_epoch is not None and prev_prev_phys_loss_epoch is not None:
                 ratio_pred = prev_pred_loss_epoch / max(prev_prev_pred_loss_epoch, 1e-8)
@@ -1044,10 +1098,10 @@ def run(cfg_path: str, overrides=None):
             prev_prev_pred_loss_epoch = prev_pred_loss_epoch
             prev_pred_loss_epoch = tr_pred
             prev_prev_phys_loss_epoch = prev_phys_loss_epoch
-            prev_phys_loss_epoch = tr_phys
+            prev_phys_loss_epoch = tr_phys_main
         # --------------------------- validation ---------------------------- #
         if val_loader is not None:
-            val_total, val_pred, val_phys, y_pred_val, y_true_val = evaluate(
+            val_total, val_pred, val_phys_main, val_phys_aux, y_pred_val, y_true_val = evaluate(
                 val_loader,
                 model,
                 device,
@@ -1057,8 +1111,10 @@ def run(cfg_path: str, overrides=None):
                 return_z=(physical_out_dim > 0),
                 return_z_aux=(aux_physical_out_dim > 0),
                 loss_weight_physical=loss_weight_physical,
+                loss_weight_physical_aux=loss_weight_physical_aux,
             )
-            log.info(f"Epoch {epoch:03d} | val_total={val_total:.5f} | pred={val_pred:.5f} | phys={val_phys:.5f}")
+            val_phys_comb = loss_weight_physical * val_phys_main + loss_weight_physical_aux * val_phys_aux
+            log.info(f"Epoch {epoch:03d} | val_total={val_total:.5f} | pred={val_pred:.5f} | phys_main={val_phys_main:.5f} | phys_aux={val_phys_aux:.5f}")
             if save_epoch_csv:
                 _append_csv_row(
                     epoch_csv_path,
@@ -1067,21 +1123,25 @@ def run(cfg_path: str, overrides=None):
                         'epoch': int(epoch),
                         'train_total': float(tr_total),
                         'train_pred': float(tr_pred),
-                        'train_phys': float(tr_phys),
+                        'train_phys_main': float(tr_phys_main),
+                        'train_phys_aux': float(tr_phys_aux),
                         'val_total': float(val_total),
                         'val_pred': float(val_pred),
-                        'val_phys': float(val_phys),
+                        'val_phys_main': float(val_phys_main),
+                        'val_phys_aux': float(val_phys_aux),
                         'lr': float(opt.param_groups[0]['lr']),
                         'epoch_seconds': float(ep_sec),
                         'samples_in_epoch': int(seen),
                         'samples_per_sec': float(samples_per_sec),
                         'loss_weight_physical': float(loss_weight_physical),
+                        'loss_weight_physical_aux': float(loss_weight_physical_aux),
                     },
                 )
             if writer:
                 writer.add_scalar('val/epoch_total_loss', val_total, epoch)
                 writer.add_scalar('val/epoch_pred_loss', val_pred, epoch)
-                writer.add_scalar('val/epoch_phys_loss', val_phys, epoch)
+                writer.add_scalar('val/epoch_phys_main_loss', val_phys_main, epoch)
+                writer.add_scalar('val/epoch_phys_aux_loss', val_phys_aux, epoch)
             if val_total < best_val:
                 best_val = val_total
                 best_epoch = epoch
@@ -1109,12 +1169,15 @@ def run(cfg_path: str, overrides=None):
                         'epoch': int(epoch),
                         'train_total': float(tr_total),
                         'train_pred': float(tr_pred),
-                        'train_phys': float(tr_phys),
+                        'train_phys_main': float(tr_phys_main),
+                        'train_phys_aux': float(tr_phys_aux),
                         'val_total': float('nan'),
                         'val_pred': float('nan'),
-                        'val_phys': float('nan'),
+                        'val_phys_main': float('nan'),
+                        'val_phys_aux': float('nan'),
                         'lr': float(opt.param_groups[0]['lr']),
                         'loss_weight_physical': float(loss_weight_physical),
+                        'loss_weight_physical_aux': float(loss_weight_physical_aux),
                     },
                 )
             if sched is not None and not isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau):
@@ -1124,7 +1187,7 @@ def run(cfg_path: str, overrides=None):
         out_csv = cfg['eval']['out_csv_val']
         mets_json = os.path.splitext(out_csv)[0] + '.metrics.json'
         ysc_path = os.path.join(cfg['data']['save_scalers_to'], 'y_scaler.joblib')
-        _vt, _vp, _vph, y_pred_val, y_true_val = evaluate(
+        _vt, _vp, _vphys_main, _vphys_aux, y_pred_val, y_true_val = evaluate(
             val_loader,
             model,
             device,
@@ -1134,6 +1197,7 @@ def run(cfg_path: str, overrides=None):
             return_z=(physical_out_dim > 0),
             return_z_aux=(aux_physical_out_dim > 0),
             loss_weight_physical=loss_weight_physical,
+            loss_weight_physical_aux=loss_weight_physical_aux,
         )
         if val_idx.size > 0:
             latlon_val = ds.coords[val_idx]
@@ -1155,7 +1219,7 @@ def run(cfg_path: str, overrides=None):
             pin_memory=(device.type == 'cuda'),
             drop_last=False,
         )
-        _tt, _tp, _tph, y_pred_t, y_true_t = evaluate(
+        _tt, _tp, _tph_main, _tph_aux, y_pred_t, y_true_t = evaluate(
             test_loader,
             model,
             device,
@@ -1165,6 +1229,7 @@ def run(cfg_path: str, overrides=None):
             return_z=(physical_out_dim > 0),
             return_z_aux=(aux_physical_out_dim > 0),
             loss_weight_physical=loss_weight_physical,
+            loss_weight_physical_aux=loss_weight_physical_aux,
         )
         out_csv_t = cfg['eval']['out_csv_test']
         mets_json_t = os.path.splitext(out_csv_t)[0] + '.metrics.json'
