@@ -347,11 +347,14 @@ def make_splits(cfg, ds):
         n_splits = int(cb.get("n_splits", 4))
         fold_index = int(cb.get("fold_index", 0))
         scale = str(cb.get("scale", "global")).lower()
+        lat_offset = float(cb.get("lat_offset", 0.0))
+        lon_offset = float(cb.get("lon_offset", 0.0))
         coords = getattr(ds, "coords", None)
         if coords is None:
             raise RuntimeError("Checkerboard split requires ds.coords (lat/lon).")
         train_pool, test_idx = checkerboard_deg_fold_indices(
-            coords, grid_deg, n_splits, fold_index, scale
+            coords, grid_deg, n_splits, fold_index, scale,
+            lat_offset=lat_offset,  lon_offset=lon_offset
         )
     else:
         raise ValueError(f"Unknown split.name: {split['name']}")
@@ -669,6 +672,8 @@ def run(cfg_path: str, overrides=None):
             n_splits = int(cb_cfg.get("n_splits", 4))
             scale = str(cb_cfg.get("scale", "conus"))
             fold_index = int(cb_cfg.get("fold_index", 0))
+            lat_offset = float(cb_cfg.get("lat_offset", 0.0))
+            lon_offset = float(cb_cfg.get("lon_offset", 0.0))
             coords = ds.coords
             visualize_checkerboard_split(
                 coords=coords,
@@ -677,6 +682,8 @@ def run(cfg_path: str, overrides=None):
                 scale=scale,
                 run_dir=run_results_dir,
                 fold_index=fold_index,
+                lat_offset=lat_offset,
+                lon_offset=lon_offset,
             )
     # Physical config
     data_cfg = cfg.get('data', {})
@@ -817,6 +824,7 @@ def run(cfg_path: str, overrides=None):
         ),
     )
     loss_fn = nn.HuberLoss()
+    loss_fn_aux_main = nn.HuberLoss(delta=0.5)
     use_amp = bool(cfg['train'].get('mixed_precision') and device.type == 'cuda')
     try:
         scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
@@ -924,7 +932,7 @@ def run(cfg_path: str, overrides=None):
                     phys_main_ds = torch.tensor(0.0, device=device)
                     phys_aux_ds = torch.tensor(0.0, device=device)
                     if expect_z and zhat is not None and z is not None:
-                        phys_main_ds = loss_fn(zhat, z)
+                        phys_main_ds = loss_fn_aux_main(zhat, z)
                     if expect_z_aux and zhat_aux is not None and z_aux is not None:
                         phys_aux_ds = loss_fn(zhat_aux, z_aux)
                     # Random NCAR samples contribute only to primary physical loss
@@ -955,7 +963,7 @@ def run(cfg_path: str, overrides=None):
                                     zhat_rand = model.physical_head(loc_rand_emb)
                                     if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
                                         zhat_rand = zhat_rand.squeeze(-1)
-                                    phys_main_rand = loss_fn(zhat_rand, z_rand)
+                                    phys_main_rand = loss_fn_aux_main(zhat_rand, z_rand)
                     # Combine dataset and random contributions for primary physical loss
                     if expect_z and (bs + n_rand) > 0:
                         phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
@@ -991,7 +999,7 @@ def run(cfg_path: str, overrides=None):
                 phys_main_ds = torch.tensor(0.0, device=device)
                 phys_aux_ds = torch.tensor(0.0, device=device)
                 if expect_z and zhat is not None and z is not None:
-                    phys_main_ds = loss_fn(zhat, z)
+                    phys_main_ds = loss_fn_aux_main(zhat, z)
                 if expect_z_aux and zhat_aux is not None and z_aux is not None:
                     phys_aux_ds = loss_fn(zhat_aux, z_aux)
                 phys_main_rand = torch.tensor(0.0, device=device)
@@ -1021,7 +1029,7 @@ def run(cfg_path: str, overrides=None):
                                 zhat_rand = model.physical_head(loc_rand_emb)
                                 if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
                                     zhat_rand = zhat_rand.squeeze(-1)
-                                phys_main_rand = loss_fn(zhat_rand, z_rand)
+                                phys_main_rand = loss_fn_aux_main(zhat_rand, z_rand)
                 if expect_z and (bs + n_rand) > 0:
                     phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
                 else:

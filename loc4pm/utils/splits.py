@@ -11,6 +11,16 @@ folds form the training pool.  This approach provides a stricter spatial
 separation than the point‑based split used previously and follows the
 methodology described in recent GeoAI evaluation papers.
 
+In addition to the standard checkerboard split, this implementation allows
+the grid boundaries to be shifted by user‑defined offsets in both latitude
+and longitude.  These offsets are specified in degrees and are subtracted
+from the grid origin (the minimum latitude/longitude of the chosen extent).
+Positive values for ``lat_offset`` move the grid northward (up), while
+positive values for ``lon_offset`` move the grid eastward (right).  Negative
+values shift the grid south or west, respectively.  By adjusting these
+parameters one can fine‑tune how the checkerboard partitions align with
+geographic features or clusters of data points.
+
 Functions
 ---------
 random_holdout_indices(n_total, test_frac, seed)
@@ -19,10 +29,10 @@ random_holdout_indices(n_total, test_frac, seed)
 spatial_fold_indices(coords, n_splits, fold_index, seed)
     Assigns samples to spatial folds based on unique coordinates.
 
-checkerboard_deg_fold_indices(coords, grid_deg, n_splits, fold_index, scale)
+checkerboard_deg_fold_indices(coords, grid_deg, n_splits, fold_index, scale, lat_offset, lon_offset)
     Assigns samples to folds using a checkerboard grid with cell size
-    ``grid_deg`` degrees.  The spatial extent can be either global or
-    constrained to the bounding box of the input coordinates.
+    ``grid_deg`` degrees.  The grid origin can be shifted by ``lat_offset``
+    and ``lon_offset`` degrees to move the checkerboard up/down or left/right.
 
 Notes
 -----
@@ -31,7 +41,10 @@ computing ``(row + column) % n_splits`` for each grid cell.  Rows and
 columns are derived from zero‑based indices of the latitude and longitude
 coordinates within the defined spatial extent.  A global extent uses the
 full range of latitudes (‑90 to 90) and longitudes (‑180 to 180); a
-regional extent uses the min/max bounds of the provided coordinates.
+regional extent uses the min/max bounds of the provided coordinates.  When
+offsets are provided, they are subtracted from the minimum latitude and
+longitude before computing row/column indices, effectively shifting the
+checkerboard pattern without altering the dataset extent.
 """
 
 import numpy as np
@@ -139,14 +152,59 @@ def checkerboard_deg_fold_indices(
     conus_geojson_url: str = _CONUS_GEOJSON_URL_DEFAULT,
     conus_exclude_ids: tuple[str, ...] = _CONUS_EXCLUDE_IDS_DEFAULT,
     conus_bbox: tuple[float, float, float, float] | None = None,
+    lat_offset: float = 0.0,
+    lon_offset: float = 0.0,
 ) -> tuple[np.ndarray, np.ndarray]:
     """
-    Assign samples to folds using a checkerboard grid of fixed degree.
+    Assign samples to folds using a checkerboard grid of fixed degree with optional shifts.
 
-    scale:
-      - 'global': use (-90..90, -180..180)
-      - 'conus':  use CONUS bbox from GeoJSON (or conus_bbox if provided)
-      - other:    fallback to data bbox
+    The latitude/longitude space is divided into square cells of size ``grid_deg``
+    degrees.  Fold identifiers cycle through ``n_splits`` by computing
+    ``(row + column) % n_splits``.  The grid origin (the minimum latitude and
+    longitude of the chosen extent) can be shifted by ``lat_offset`` and
+    ``lon_offset`` degrees, respectively.  Shifting the origin effectively
+    translates the checkerboard pattern up/down or left/right without changing
+    the overall extent.  Positive values for ``lat_offset`` move the pattern
+    northward (increasing latitude), while positive values for ``lon_offset``
+    move it eastward (increasing longitude).
+
+    Parameters
+    ----------
+    coords : np.ndarray of shape (N, 2)
+        Array of [latitude, longitude] coordinates for each sample.
+    grid_deg : float
+        Size of each grid cell in degrees.
+    n_splits : int
+        Number of checkerboard partitions.
+    fold_index : int
+        Which fold to use as the test set (0 <= fold_index < n_splits).
+    scale : str, optional
+        Spatial extent to use: 'global', 'conus', or other.  'conus' uses the
+        CONUS bounding box derived from a GeoJSON file; any other value
+        defaults to the data bounding box.  Default is 'global'.
+    conus_geojson_url : str, optional
+        URL of a GeoJSON file containing US state boundaries.  Only used
+        when ``scale`` is 'conus'.  Defaults to a Mapbox example dataset.
+    conus_exclude_ids : tuple[str,...], optional
+        Tuple of state identifiers to exclude when computing the CONUS
+        bounding box (e.g. Alaska, Hawaii, Puerto Rico).  Only used when
+        ``scale`` is 'conus'.
+    conus_bbox : tuple[float,float,float,float] or None, optional
+        Explicit bounding box (min_lon, min_lat, max_lon, max_lat) for CONUS.
+        If provided, this overrides loading from GeoJSON.  Only used when
+        ``scale`` is 'conus'.  Defaults to None.
+    lat_offset : float, optional
+        Number of degrees to shift the grid origin northward (positive) or
+        southward (negative).  Default is 0.0 (no shift).
+    lon_offset : float, optional
+        Number of degrees to shift the grid origin eastward (positive) or
+        westward (negative).  Default is 0.0 (no shift).
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        A pair of arrays (train_indices, test_indices) specifying which sample
+        indices belong to the training and test sets.
     """
     coords = np.asarray(coords, dtype=float)
     if coords.ndim != 2 or coords.shape[1] != 2:
@@ -165,6 +223,7 @@ def checkerboard_deg_fold_indices(
         max_lon = valid_lon.max() if valid_lon.size else 180.0
         return min_lon, min_lat, max_lon, max_lat
 
+    # Determine bounding box based on scale
     if scale_lower == "global":
         min_lat, max_lat = -90.0, 90.0
         min_lon, max_lon = -180.0, 180.0
@@ -187,15 +246,19 @@ def checkerboard_deg_fold_indices(
         min_lon, min_lat, max_lon, max_lat = _data_bbox()
 
     with np.errstate(invalid="ignore"):
-        row = np.floor((lat - min_lat) / float(grid_deg)).astype(int)
-        col = np.floor((lon - min_lon) / float(grid_deg)).astype(int)
+        # Subtract offsets to shift the checkerboard origin
+        row = np.floor(((lat - min_lat) - float(lat_offset)) / float(grid_deg)).astype(int)
+        col = np.floor(((lon - min_lon) - float(lon_offset)) / float(grid_deg)).astype(int)
 
-    row[np.isnan(lat) | np.isnan(row)] = -1
-    col[np.isnan(lon) | np.isnan(col)] = -1
+    # Mark coordinates with NaN latitude/longitude as invalid (-1)
+    row[np.isnan(lat)] = -1
+    col[np.isnan(lon)] = -1
 
     fold_ids = np.full(len(coords), -1, dtype=int)
-    valid_mask = (row >= 0) & (col >= 0)
-    fold_ids[valid_mask] = (row[valid_mask] + col[valid_mask]) % int(n_splits)
+    # Consider all non-NaN coordinates as valid; negative row/col are allowed
+    valid_mask = (~np.isnan(lat)) & (~np.isnan(lon))
+    if valid_mask.any():
+        fold_ids[valid_mask] = (row[valid_mask] + col[valid_mask]) % int(n_splits)
 
     fold_index = int(fold_index)
     if fold_index < 0 or fold_index >= int(n_splits):
