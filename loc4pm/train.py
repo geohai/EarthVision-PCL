@@ -824,7 +824,7 @@ def run(cfg_path: str, overrides=None):
         ),
     )
     loss_fn = nn.HuberLoss()
-    loss_fn_aux_main = nn.HuberLoss(delta=0.5)
+    loss_fn_aux_main = nn.HuberLoss(delta=1.0)
     use_amp = bool(cfg['train'].get('mixed_precision') and device.type == 'cuda')
     try:
         scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
