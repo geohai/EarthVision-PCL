@@ -6,7 +6,7 @@ simulation heads.  In addition to the original observation targets, it
 supports augmenting the training batches with randomly sampled NCAR reanalysis
 points to better exploit the gapless simulation data.  The number of random
 NCAR points sampled per batch is controlled via ``train.ncar_random_ratio``
-in the configuration.  When enabled, the physical loss is normalized by the
+in the configuration.  When enabled, the physical loss is normalised by the
 combined number of NCAR and observation samples to balance the contributions
 from supervised and unsupervised data.  When auxiliary physical targets are
 enabled (via ``data.z_aux_feature_indices``), the model predicts both the
@@ -16,6 +16,14 @@ compute physical losses for both heads separately; each can be assigned its
 own weight (``loss_weight_physical`` for the primary head and
 ``loss_weight_physical_aux`` for the auxiliary head).  Both losses are
 logged independently to facilitate monitoring and tuning.
+
+This version extends random NCAR augmentation to sample auxiliary physical
+targets when available.  The random sampler returns four arrays:
+``coords``, ``time`` (month or day-of-year), ``z_rand`` for primary
+variables and ``z_aux_rand`` for auxiliary variables.  The auxiliary random
+values are normalised using the dataset's ``z_aux_mean`` and ``z_aux_std``
+when available and contribute to the auxiliary physical loss via a
+weighted average across both dataset and random samples.
 """
 
 from __future__ import annotations
@@ -412,7 +420,7 @@ def _split_model_outputs(out):
     """Unpack model outputs into (yhat, zhat, zhat_aux, attn).
 
     The model may return different combinations of outputs depending on whether
-    physical heads are enabled.  This helper normalizes the output into a
+    physical heads are enabled.  This helper normalises the output into a
     four‑tuple where missing values are set to ``None``.
     """
     yhat = zhat = zhat_aux = attn = None
@@ -646,10 +654,12 @@ def run(cfg_path: str, overrides=None):
     device = torch.device('cuda' if (req_dev == 'cuda' and torch.cuda.is_available()) else 'cpu')
     # Data + splits + loaders
     ds = make_dataset(cfg)
-    # Grab scalers and stats for z (primary) from dataset
+    # Grab scalers and stats for z (primary) and z_aux (auxiliary) from dataset
     z_scaler = getattr(ds, 'z_scaler', None)
     z_mean = getattr(ds, 'z_mean', None)
     z_std = getattr(ds, 'z_std', None)
+    z_aux_mean = getattr(ds, 'z_aux_mean', None)
+    z_aux_std = getattr(ds, 'z_aux_std', None)
     train_idx, val_idx, test_idx = make_splits(cfg, ds)
     train_loader, val_loader, input_size = make_loaders(cfg, ds, train_idx, val_idx, device)
     # Compute counts
@@ -855,7 +865,7 @@ def run(cfg_path: str, overrides=None):
     if ncar_ratio > 0.0 and physical_out_dim > 0:
         try:
             _load_ncar_grid_ds(ncar_path)
-            test_coords, _, _ = _sample_ncar_points_ds(1)
+            test_coords, _, _, _ = _sample_ncar_points_ds(1)
             if test_coords.size == 0:
                 log.warning("NCAR random ratio requested but no data loaded from %s", ncar_path)
                 ncar_ratio = 0.0
@@ -913,20 +923,6 @@ def run(cfg_path: str, overrides=None):
                         zhat_aux = zhat_aux.squeeze(-1)
                     if z_aux is not None and z_aux.ndim > 1 and z_aux.shape[-1] == 1:
                         z_aux = z_aux.squeeze(-1)
-                    # if epoch == 1:
-                    #     def stats(name, t):
-                    #         t = t.detach().float().view(-1)
-                    #         print(
-                    #             f"{name}: shape={tuple(t.shape)} mean={t.mean().item():.4f} std={t.std(unbiased=False).item():.4f} "
-                    #             f"min={t.min().item():.4f} max={t.max().item():.4f}")
-                    #
-                    #     if z is not None and zhat is not None:
-                    #         stats("z (dataset)", z)
-                    #         stats("zhat (pred)", zhat)
-                    #
-                    #     if 'z_rand' in locals() and z_rand is not None and 'zhat_rand' in locals() and zhat_rand is not None:
-                    #         stats("z_rand (NCAR)", z_rand)
-                    #         stats("zhat_rand (pred)", zhat_rand)
                     pred_loss = loss_fn(yhat, y)
                     # Compute dataset physical losses (unweighted)
                     phys_main_ds = torch.tensor(0.0, device=device)
@@ -935,21 +931,29 @@ def run(cfg_path: str, overrides=None):
                         phys_main_ds = loss_fn_aux_main(zhat, z)
                     if expect_z_aux and zhat_aux is not None and z_aux is not None:
                         phys_aux_ds = loss_fn(zhat_aux, z_aux)
-                    # Random NCAR samples contribute only to primary physical loss
+                    # Random NCAR samples contribute to both primary and auxiliary physical losses
                     phys_main_rand = torch.tensor(0.0, device=device)
+                    phys_aux_rand = torch.tensor(0.0, device=device)
                     n_rand = 0
-                    if ncar_ratio > 0.0 and expect_z:
+                    if ncar_ratio > 0.0 and (expect_z or expect_z_aux):
                         n_rand = int(round(ncar_ratio * bs))
                         rand_total_samples += n_rand
                         if n_rand > 0:
-                            coords_rand_np, month_rand_np, z_rand_np = _sample_ncar_points_ds(n_rand)
-                            if z_rand_np.size > 0:
+                            # sample coords_rand_np, month_rand_np, z_rand_np, z_aux_rand_np
+                            coords_rand_np, month_rand_np, z_rand_np, z_aux_rand_np = _sample_ncar_points_ds(n_rand)
+                            # Normalise primary values
+                            if expect_z and z_rand_np.size > 0:
                                 if z_mean is not None and z_std is not None:
                                     z_rand_np = ((z_rand_np - z_mean) / z_std).astype(np.float32)
                                 elif z_scaler is not None:
                                     z_reshaped = z_rand_np.reshape(-1, 1, 1)
                                     z_scaled = z_scaler.transform_x(z_reshaped).reshape(-1)
                                     z_rand_np = z_scaled.astype(np.float32)
+                            # Normalise auxiliary values
+                            if expect_z_aux and z_aux_rand_np.size > 0:
+                                z_aux_rand_np = z_aux_rand_np.astype(np.float32)
+                                if z_aux_mean is not None and z_aux_std is not None:
+                                    z_aux_rand_np = (z_aux_rand_np - z_aux_mean) / z_aux_std
                             if coords_rand_np.size > 0:
                                 coords_rand = torch.tensor(coords_rand_np, dtype=torch.float32, device=device)
                                 month_rand = (
@@ -957,20 +961,30 @@ def run(cfg_path: str, overrides=None):
                                     if return_month
                                     else None
                                 )
-                                z_rand = torch.tensor(z_rand_np, dtype=torch.float32, device=device)
+                                # Convert random primary and auxiliary values to tensors if expected
+                                z_rand = torch.tensor(z_rand_np, dtype=torch.float32, device=device) if expect_z else None
+                                z_aux_rand = torch.tensor(z_aux_rand_np, dtype=torch.float32, device=device) if expect_z_aux else None
                                 loc_rand_emb = model.loc_encoder(coords_rand, month_rand) if use_location else None
-                                if loc_rand_emb is not None and model.physical_head is not None:
-                                    zhat_rand = model.physical_head(loc_rand_emb)
-                                    if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
-                                        zhat_rand = zhat_rand.squeeze(-1)
-                                    phys_main_rand = loss_fn_aux_main(zhat_rand, z_rand)
-                    # Combine dataset and random contributions for primary physical loss
+                                if loc_rand_emb is not None:
+                                    if expect_z and model.physical_head is not None and z_rand is not None:
+                                        zhat_rand = model.physical_head(loc_rand_emb)
+                                        if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
+                                            zhat_rand = zhat_rand.squeeze(-1)
+                                        phys_main_rand = loss_fn_aux_main(zhat_rand, z_rand)
+                                    if expect_z_aux and model.aux_physical_head is not None and z_aux_rand is not None:
+                                        zhat_aux_rand = model.aux_physical_head(loc_rand_emb)
+                                        if zhat_aux_rand.ndim > 1 and zhat_aux_rand.shape[-1] == 1:
+                                            zhat_aux_rand = zhat_aux_rand.squeeze(-1)
+                                        phys_aux_rand = loss_fn(zhat_aux_rand, z_aux_rand)
+                    # Combine dataset and random contributions
                     if expect_z and (bs + n_rand) > 0:
                         phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
                     else:
                         phys_main = torch.tensor(0.0, device=device)
-                    # Auxiliary physical loss has no random samples
-                    phys_aux = phys_aux_ds
+                    if expect_z_aux and (bs + n_rand) > 0:
+                        phys_aux = (phys_aux_ds * bs + phys_aux_rand * max(n_rand, 0)) / float(bs + n_rand)
+                    else:
+                        phys_aux = phys_aux_ds
                     # Weighted physical contributions
                     weighted_main = loss_weight_physical * phys_main
                     weighted_aux = loss_weight_physical_aux * phys_aux
@@ -1003,19 +1017,24 @@ def run(cfg_path: str, overrides=None):
                 if expect_z_aux and zhat_aux is not None and z_aux is not None:
                     phys_aux_ds = loss_fn(zhat_aux, z_aux)
                 phys_main_rand = torch.tensor(0.0, device=device)
+                phys_aux_rand = torch.tensor(0.0, device=device)
                 n_rand = 0
-                if ncar_ratio > 0.0 and expect_z:
+                if ncar_ratio > 0.0 and (expect_z or expect_z_aux):
                     n_rand = int(round(ncar_ratio * bs))
                     rand_total_samples += n_rand
                     if n_rand > 0:
-                        coords_rand_np, month_rand_np, z_rand_np = _sample_ncar_points_ds(n_rand)
-                        if z_rand_np.size > 0:
+                        coords_rand_np, month_rand_np, z_rand_np, z_aux_rand_np = _sample_ncar_points_ds(n_rand)
+                        if expect_z and z_rand_np.size > 0:
                             if z_mean is not None and z_std is not None:
                                 z_rand_np = ((z_rand_np - z_mean) / z_std).astype(np.float32)
                             elif z_scaler is not None:
                                 z_reshaped = z_rand_np.reshape(-1, 1, 1)
                                 z_scaled = z_scaler.transform_x(z_reshaped).reshape(-1)
                                 z_rand_np = z_scaled.astype(np.float32)
+                        if expect_z_aux and z_aux_rand_np.size > 0:
+                            z_aux_rand_np = z_aux_rand_np.astype(np.float32)
+                            if z_aux_mean is not None and z_aux_std is not None:
+                                z_aux_rand_np = (z_aux_rand_np - z_aux_mean) / z_aux_std
                         if coords_rand_np.size > 0:
                             coords_rand = torch.tensor(coords_rand_np, dtype=torch.float32, device=device)
                             month_rand = (
@@ -1023,18 +1042,28 @@ def run(cfg_path: str, overrides=None):
                                 if return_month
                                 else None
                             )
-                            z_rand = torch.tensor(z_rand_np, dtype=torch.float32, device=device)
+                            z_rand = torch.tensor(z_rand_np, dtype=torch.float32, device=device) if expect_z else None
+                            z_aux_rand = torch.tensor(z_aux_rand_np, dtype=torch.float32, device=device) if expect_z_aux else None
                             loc_rand_emb = model.loc_encoder(coords_rand, month_rand) if use_location else None
-                            if loc_rand_emb is not None and model.physical_head is not None:
-                                zhat_rand = model.physical_head(loc_rand_emb)
-                                if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
-                                    zhat_rand = zhat_rand.squeeze(-1)
-                                phys_main_rand = loss_fn_aux_main(zhat_rand, z_rand)
+                            if loc_rand_emb is not None:
+                                if expect_z and model.physical_head is not None and z_rand is not None:
+                                    zhat_rand = model.physical_head(loc_rand_emb)
+                                    if zhat_rand.ndim > 1 and zhat_rand.shape[-1] == 1:
+                                        zhat_rand = zhat_rand.squeeze(-1)
+                                    phys_main_rand = loss_fn_aux_main(zhat_rand, z_rand)
+                                if expect_z_aux and model.aux_physical_head is not None and z_aux_rand is not None:
+                                    zhat_aux_rand = model.aux_physical_head(loc_rand_emb)
+                                    if zhat_aux_rand.ndim > 1 and zhat_aux_rand.shape[-1] == 1:
+                                        zhat_aux_rand = zhat_aux_rand.squeeze(-1)
+                                    phys_aux_rand = loss_fn(zhat_aux_rand, z_aux_rand)
                 if expect_z and (bs + n_rand) > 0:
                     phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
                 else:
                     phys_main = torch.tensor(0.0, device=device)
-                phys_aux = phys_aux_ds
+                if expect_z_aux and (bs + n_rand) > 0:
+                    phys_aux = (phys_aux_ds * bs + phys_aux_rand * max(n_rand, 0)) / float(bs + n_rand)
+                else:
+                    phys_aux = phys_aux_ds
                 weighted_main = loss_weight_physical * phys_main
                 weighted_aux = loss_weight_physical_aux * phys_aux
                 phys_contrib = weighted_main + weighted_aux

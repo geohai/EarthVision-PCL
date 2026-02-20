@@ -12,6 +12,13 @@ standardised observation ``y``.  When precomputed statistics are
 provided for any of these variables, they are used for z‑score
 standardisation; otherwise the dataset falls back to the configured
 min/max or robust scalers.
+
+This version also supports loading auxiliary physical targets from
+precomputed NCAR Parquet files and returning them when performing
+random sampling.  The global variable ``_NCAR_AUX_COLS`` is set during
+dataset initialisation to indicate which NCAR columns correspond to
+auxiliary variables, and functions ``load_ncar_grid`` and
+``sample_ncar_points`` have been extended to handle these values.
 """
 
 from __future__ import annotations
@@ -140,6 +147,7 @@ class ZScoreScalerLite:
     it defaults to one to avoid division by zero.  The scaler also provides an ``inverse_y`` method
     to recover the original units.
     """
+
     def __init__(self, mean: float, std: float) -> None:
         self.mean = float(mean)
         self.std = float(std) if float(std) != 0.0 else 1.0
@@ -416,6 +424,14 @@ class DailyTSDataset(Dataset):
         self._cache: Dict[str, np.ndarray] = {}
         self._cache_order: List[str] = []
 
+        # Set NCAR auxiliary columns for random sampling
+        # Use z_aux_feature_names to determine which NCAR columns correspond to auxiliary variables.
+        global _NCAR_AUX_COLS
+        if self.z_aux_feature_names:
+            _NCAR_AUX_COLS = list(self.z_aux_feature_names)
+        else:
+            _NCAR_AUX_COLS = None
+
     def __len__(self) -> int:
         return len(self.index_map)
 
@@ -472,26 +488,43 @@ class DailyTSDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
-# NCAR grid loading and random sampling (unchanged from original)
-# These functions are reproduced here to make the dataset self‑contained.
+# NCAR grid loading and random sampling (extended to support auxiliary targets)
 _NCAR_CACHE: Dict[str, np.ndarray] = {}
 _DEFAULT_TIME_VARIANT: str = 'monthly'
+_NCAR_AUX_COLS: Optional[List[str]] = None
 
 
 def load_ncar_grid(ncar_path: str) -> None:
+    """Load NCAR gridded data from Parquet files into a global cache.
+
+    This function loads latitude/longitude bounds, the primary physical
+    variable (PM25_TOT) and optionally auxiliary variables specified by
+    ``_NCAR_AUX_COLS`` from all Parquet files under ``ncar_path``.  The
+    loaded arrays are stored in the global cache ``_NCAR_CACHE`` for
+    subsequent random sampling.
+    """
     if 'lat_min' in _NCAR_CACHE:
         return
     files = sorted([os.path.join(ncar_path, f) for f in os.listdir(ncar_path) if f.endswith('.parquet')])
     dfs: List[pd.DataFrame] = []
+    # Base columns required for sampling
     required = {
         'lat_nw', 'lon_nw', 'lat_ne', 'lon_ne', 'lat_se', 'lon_se',
         'lat_sw', 'lon_sw', 'PM25_TOT', 'date'
     }
+    # Include auxiliary columns if provided
+    aux_cols: List[str] = []
+    if _NCAR_AUX_COLS:
+        for c in _NCAR_AUX_COLS:
+            if c not in required:
+                aux_cols.append(c)
+        required.update(aux_cols)
     for f in files:
         try:
             df = pd.read_parquet(f)
         except Exception:
             continue
+        # Skip files lacking required columns
         if df.empty or not required.issubset(df.columns):
             continue
         dfs.append(df[list(required)])
@@ -505,6 +538,10 @@ def load_ncar_grid(ncar_path: str) -> None:
     _NCAR_CACHE['lon_min'] = corners_lon.min(axis=1)
     _NCAR_CACHE['lon_max'] = corners_lon.max(axis=1)
     _NCAR_CACHE['z'] = df_all['PM25_TOT'].to_numpy(dtype=float)
+    # Store auxiliary arrays if available
+    if aux_cols:
+        _NCAR_CACHE['z_aux'] = df_all[aux_cols].to_numpy(dtype=float)
+        _NCAR_CACHE['z_aux_cols'] = aux_cols
     try:
         dt = pd.to_datetime(df_all['date'])
         months = dt.dt.month.to_numpy(dtype=int)
@@ -516,12 +553,30 @@ def load_ncar_grid(ncar_path: str) -> None:
     _NCAR_CACHE['doy'] = doys
 
 
-def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Randomly sample NCAR grid cells and return random coordinate/time pairs.
+
+    Args:
+        num_samples: The number of random NCAR points to sample.
+        time_variant: Either ``'monthly'`` or ``'doy'`` (day-of-year) to
+            determine which temporal index to return.  Defaults to the
+            dataset's ``time_variant``.
+
+    Returns:
+        A tuple ``(coords, time_vals, z_vals, z_aux_vals)``:
+
+        - ``coords``: array of shape [N, 2] with random latitude and longitude.
+        - ``time_vals``: array of shape [N] with month indices (1–12) or day-of-year indices.
+        - ``z_vals``: array of shape [N] with sampled primary physical values (PM25_TOT).
+        - ``z_aux_vals``: array of shape [N, A] with sampled auxiliary physical values; if no
+          auxiliary columns are available, this will have zero columns.
+    """
     if num_samples <= 0 or 'lat_min' not in _NCAR_CACHE:
         return (
             np.zeros((0, 2), dtype=float),
             np.zeros((0,), dtype=int),
             np.zeros((0,), dtype=float),
+            np.zeros((0, 0), dtype=float),
         )
     lat_min = _NCAR_CACHE['lat_min']
     lat_max = _NCAR_CACHE['lat_max']
@@ -545,4 +600,15 @@ def sample_ncar_points(num_samples: int, time_variant: Optional[str] = None) -> 
         time_full = months_full
     time_vals = time_full[idxs]
     z_vals = z_vals_full[idxs]
-    return coords.astype(float), time_vals.astype(int), z_vals.astype(float)
+    # Gather auxiliary values if available; otherwise return empty columns
+    if 'z_aux' in _NCAR_CACHE:
+        z_aux_full = _NCAR_CACHE['z_aux']
+        z_aux_vals = z_aux_full[idxs]
+    else:
+        z_aux_vals = np.zeros((len(idxs), 0), dtype=float)
+    return (
+        coords.astype(float),
+        time_vals.astype(int),
+        z_vals.astype(float),
+        z_aux_vals.astype(float),
+    )
