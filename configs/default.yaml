@@ -106,16 +106,16 @@ model:
 
 # NEW: explicit split section
 split:
-  name: checkerboard-deg             # random | spatial | checkerboard-deg
+  name: spatial             # random | spatial | checkerboard-deg
   seed: 42                 # ensures reproducible splits
-  test_split: 0.10         # fraction for *test* holdout (kept fixed across runs)
-  val_split: 0.10          # fraction for *validation* (from remaining train pool)
+  test_split: 0.50         # fraction for *test* holdout (kept fixed across runs)
+  val_split: 0.05          # fraction for *validation* (from remaining train pool)
   spatial:
     n_splits: 2           # used when name=spatial
     fold_index: 0          # which fold is test (0..n_splits-1)
   checkerboard:
     scale: conus           # conus or global
-    deg: 4.0               # cell size in degrees
+    deg: 8.0               # cell size in degrees
     n_splits: 2            # number of folds in the checkerboard
     fold_index: 0          # which fold is used as test (0..n_splits-1)
     visualize: true        # optinal: for grid visualization downstream
@@ -123,8 +123,8 @@ split:
     # northward/southward and eastward/westward, respectively.  Positive
     # values move the grid up and right; negative values move it down or
     # left.  Set to zero for the default alignment.
-    lat_offset: 1.4
-    lon_offset: -1.4
+    lat_offset: 0.0
+    lon_offset: 0.0
 
 train:
   device: cuda
@@ -163,12 +163,23 @@ train:
   # ``loss_weight_physical_aux`` controls the auxiliary physical head
   # contribution.  Adjust these weights to balance the relative importance
   # of supervised PM2.5 prediction versus physical simulation targets.
-  loss_weight_physical: 0.20
-  loss_weight_physical_aux: 0.40
+  loss_weight_physical: 0.2
+  loss_weight_physical_aux: 0.4
   # Ratio of random NCAR samples drawn per batch relative to batch size.  A
   # value of 0 disables augmentation; 0.5 would draw roughly half as many
   # random samples as supervised samples.
   ncar_random_ratio: 16.0
+  # -------- Location encoder pretraining (two-stage) --------
+  # First N epochs: train only location encoder + physical heads.
+  # After that: freeze location encoder and train EO encoder (LSTM branch).
+  loc_pretrain_epochs: 0
+  # Scale on observation (PM2.5) loss during pretraining.
+  # 0.0 = physical-only pretraining (recommended for climplicit-style comparison)
+  pretrain_pred_weight: 0.0
+
+  # Physical loss weights during pretraining (defaults to loss_weight_physical/_aux if you remove them)
+  pretrain_loss_weight_physical: 0.20
+  pretrain_loss_weight_physical_aux: 0.40
   # Dynamic weighting for the physical loss.  When enabled, the loss weight for
   # the physical head is updated each epoch based on recent prediction and
   # physical losses using a Dynamic Weighted Average (DWA) mechanism.  ``temperature``

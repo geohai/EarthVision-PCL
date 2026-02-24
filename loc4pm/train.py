@@ -531,6 +531,7 @@ def evaluate(
     return_month: bool = False,
     return_z: bool = False,
     return_z_aux: bool = False,
+    pred_weight: float = 1.0,
     loss_weight_physical: float = 0.0,
     loss_weight_physical_aux: float = 0.0,
 ):
@@ -580,7 +581,7 @@ def evaluate(
                 phys_aux = loss_fn(zhat_aux, z_aux)
             # Weighted physical loss contribution
             phys_contrib = loss_weight_physical * phys_main + loss_weight_physical_aux * phys_aux
-            loss = pred_loss + phys_contrib
+            loss = pred_weight * pred_loss + phys_contrib
             tot_losses.append(loss.item())
             pred_losses.append(pred_loss.item())
             phys_main_losses.append(float(phys_main.item()))
@@ -603,6 +604,22 @@ def run(cfg_path: str, overrides=None):
         _apply_overrides(cfg, _parse_overrides(overrides))
     cfg = _expand_all_strings(cfg, cfg)
     _expand_cfg_strings(cfg)
+    # ---------------------------------------------------------------------
+    # Location encoder pretraining configuration (two-stage training)
+    # If train.loc_pretrain_epochs > 0, the first N epochs train ONLY the
+    # location encoder (+ physical heads), freezing the EO encoder (LSTM/attn/head).
+    # After that, location encoder is frozen and EO branch is trained.
+    loc_pretrain_epochs = int(cfg.get('train', {}).get('loc_pretrain_epochs', 0) or 0)
+    pretrain_pred_weight = float(cfg.get('train', {}).get('pretrain_pred_weight', 0.0))
+    pretrain_loss_weight_physical = float(
+        cfg.get('train', {}).get('pretrain_loss_weight_physical', cfg['train'].get('loss_weight_physical', 0.0))
+    )
+    pretrain_loss_weight_physical_aux = float(
+        cfg.get('train', {}).get(
+            'pretrain_loss_weight_physical_aux',
+            cfg['train'].get('loss_weight_physical_aux', cfg['train'].get('loss_weight_physical', 0.0)),
+        )
+    )
     # From‑scratch override to ensure location backbones aren't pretrained/frozen.
     from_scratch = bool(cfg.get('train', {}).get('from_scratch', False))
     if from_scratch:
@@ -886,6 +903,79 @@ def run(cfg_path: str, overrides=None):
     # ----------------------------- training -------------------------------- #
     train_start = time.perf_counter()
     for epoch in range(1, cfg['train']['epochs'] + 1):
+        # Two-stage training: location-pretrain then EO-train
+        is_pretrain = bool(use_location and (loc_pretrain_epochs > 0) and (epoch <= loc_pretrain_epochs))
+
+        if use_location and loc_pretrain_epochs > 0:
+            if epoch == 1:
+                # Freeze EO branch
+                for p in model.lstm.parameters():
+                    p.requires_grad = False
+                for p in model.attn.parameters():
+                    p.requires_grad = False
+                for p in model.head.parameters():
+                    p.requires_grad = False
+
+                # Unfreeze location branch
+                if model.loc_encoder is not None:
+                    for p in model.loc_encoder.parameters():
+                        p.requires_grad = True
+                if model.physical_head is not None:
+                    for p in model.physical_head.parameters():
+                        p.requires_grad = True
+                if model.aux_physical_head is not None:
+                    for p in model.aux_physical_head.parameters():
+                        p.requires_grad = True
+
+                log.info(
+                    "Stage: LOCATION PRETRAIN (%d epochs) | pred_weight=%.3f | c_phys=%.3f | c_aux=%.3f",
+                    loc_pretrain_epochs,
+                    pretrain_pred_weight,
+                    pretrain_loss_weight_physical,
+                    pretrain_loss_weight_physical_aux,
+                )
+
+            elif epoch == loc_pretrain_epochs + 1:
+                # Freeze location branch
+                if model.loc_encoder is not None:
+                    for p in model.loc_encoder.parameters():
+                        p.requires_grad = False
+                if model.physical_head is not None:
+                    for p in model.physical_head.parameters():
+                        p.requires_grad = False
+                if model.aux_physical_head is not None:
+                    for p in model.aux_physical_head.parameters():
+                        p.requires_grad = False
+
+                # Unfreeze EO branch
+                for p in model.lstm.parameters():
+                    p.requires_grad = True
+                for p in model.attn.parameters():
+                    p.requires_grad = True
+                for p in model.head.parameters():
+                    p.requires_grad = True
+
+                # Reset early-stopping baseline so pretrain objective doesn't dominate
+                best_val = float('inf')
+                best_epoch = epoch - 1
+                log.info("Stage: EO TRAIN (location frozen) | prediction-only loss (physical weights set to 0).")
+
+        # Per-epoch weights:
+        # - During pretraining: use pretrain_* weights (often pred_weight=0 for physical-only).
+        # - During EO training after pretraining: prediction-only (physical weights 0).
+        # - If no pretraining: use the normal weights.
+        if is_pretrain:
+            curr_pred_weight = pretrain_pred_weight
+            curr_weight_physical = pretrain_loss_weight_physical
+            curr_weight_physical_aux = pretrain_loss_weight_physical_aux
+        elif use_location and loc_pretrain_epochs > 0:
+            curr_pred_weight = 1.0
+            curr_weight_physical = 0.0
+            curr_weight_physical_aux = 0.0
+        else:
+            curr_pred_weight = 1.0
+            curr_weight_physical = loss_weight_physical
+            curr_weight_physical_aux = loss_weight_physical_aux
         ep_t0 = time.perf_counter()
         model.train()
         tr_tot_losses, tr_pred_losses = [], []
@@ -986,10 +1076,10 @@ def run(cfg_path: str, overrides=None):
                     else:
                         phys_aux = phys_aux_ds
                     # Weighted physical contributions
-                    weighted_main = loss_weight_physical * phys_main
-                    weighted_aux = loss_weight_physical_aux * phys_aux
+                    weighted_main = curr_weight_physical * phys_main
+                    weighted_aux = curr_weight_physical_aux * phys_aux
                     phys_contrib = weighted_main + weighted_aux
-                    loss = pred_loss + phys_contrib
+                    loss = curr_pred_weight * pred_loss + phys_contrib
                 scaler.scale(loss).backward()
                 if cfg['train'].get('grad_clip_norm') is not None:
                     scaler.unscale_(opt)
@@ -1057,17 +1147,23 @@ def run(cfg_path: str, overrides=None):
                                         zhat_aux_rand = zhat_aux_rand.squeeze(-1)
                                     phys_aux_rand = loss_fn(zhat_aux_rand, z_aux_rand)
                 if expect_z and (bs + n_rand) > 0:
-                    phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
+                    # LE train on both ds and rand
+                    # phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
+                    # LE train only on rand
+                    phys_main = (phys_main_rand * max(n_rand, 0)) / float(n_rand)
                 else:
                     phys_main = torch.tensor(0.0, device=device)
                 if expect_z_aux and (bs + n_rand) > 0:
-                    phys_aux = (phys_aux_ds * bs + phys_aux_rand * max(n_rand, 0)) / float(bs + n_rand)
+                    # LE train on both ds and rand
+                    # phys_aux = (phys_aux_ds * bs + phys_aux_rand * max(n_rand, 0)) / float(bs + n_rand)
+                    # LE train only on rand
+                    phys_aux = (phys_aux_rand * max(n_rand, 0)) / float(n_rand)
                 else:
                     phys_aux = phys_aux_ds
-                weighted_main = loss_weight_physical * phys_main
-                weighted_aux = loss_weight_physical_aux * phys_aux
+                weighted_main = curr_weight_physical * phys_main
+                weighted_aux = curr_weight_physical_aux * phys_aux
                 phys_contrib = weighted_main + weighted_aux
-                loss = pred_loss + phys_contrib
+                loss = curr_pred_weight * pred_loss + phys_contrib
                 loss.backward()
                 if cfg['train'].get('grad_clip_norm') is not None:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), cfg['train']['grad_clip_norm'])
@@ -1147,10 +1243,11 @@ def run(cfg_path: str, overrides=None):
                 return_month=return_month,
                 return_z=(physical_out_dim > 0),
                 return_z_aux=(aux_physical_out_dim > 0),
-                loss_weight_physical=loss_weight_physical,
-                loss_weight_physical_aux=loss_weight_physical_aux,
+                pred_weight=curr_pred_weight,
+                loss_weight_physical=curr_weight_physical,
+                loss_weight_physical_aux=curr_weight_physical_aux,
             )
-            val_phys_comb = loss_weight_physical * val_phys_main + loss_weight_physical_aux * val_phys_aux
+            val_phys_comb = curr_weight_physical * val_phys_main + curr_weight_physical_aux * val_phys_aux
             log.info(f"Epoch {epoch:03d} | val_total={val_total:.5f} | pred={val_pred:.5f} | phys_main={val_phys_main:.5f} | phys_aux={val_phys_aux:.5f}")
             if save_epoch_csv:
                 _append_csv_row(
