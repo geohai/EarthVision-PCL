@@ -955,6 +955,16 @@ def run(cfg_path: str, overrides=None):
                 for p in model.head.parameters():
                     p.requires_grad = True
 
+                # Rebuild optimizer to include newly-unfrozen params
+                param_groups = []
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        top = name.split('.')[0]
+                        wd = branch_wd.get(top, default_wd)
+                        param_groups.append({'params': [param], 'weight_decay': wd})
+                opt = torch.optim.AdamW(param_groups, lr=lr, weight_decay=0.0)
+                sched = make_scheduler(opt, cfg)
+
                 # Reset early-stopping baseline so pretrain objective doesn't dominate
                 best_val = float('inf')
                 best_epoch = epoch - 1
@@ -1148,16 +1158,16 @@ def run(cfg_path: str, overrides=None):
                                     phys_aux_rand = loss_fn(zhat_aux_rand, z_aux_rand)
                 if expect_z and (bs + n_rand) > 0:
                     # LE train on both ds and rand
-                    # phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
+                    phys_main = (phys_main_ds * bs + phys_main_rand * max(n_rand, 0)) / float(bs + n_rand)
                     # LE train only on rand
-                    phys_main = (phys_main_rand * max(n_rand, 0)) / float(n_rand)
+                    # phys_main = (phys_main_rand * max(n_rand, 0)) / float(n_rand)
                 else:
                     phys_main = torch.tensor(0.0, device=device)
                 if expect_z_aux and (bs + n_rand) > 0:
                     # LE train on both ds and rand
-                    # phys_aux = (phys_aux_ds * bs + phys_aux_rand * max(n_rand, 0)) / float(bs + n_rand)
+                    phys_aux = (phys_aux_ds * bs + phys_aux_rand * max(n_rand, 0)) / float(bs + n_rand)
                     # LE train only on rand
-                    phys_aux = (phys_aux_rand * max(n_rand, 0)) / float(n_rand)
+                    # phys_aux = (phys_aux_rand * max(n_rand, 0)) / float(n_rand)
                 else:
                     phys_aux = phys_aux_ds
                 weighted_main = curr_weight_physical * phys_main

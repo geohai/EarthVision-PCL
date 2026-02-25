@@ -106,7 +106,7 @@ model:
 
 # NEW: explicit split section
 split:
-  name: spatial             # random | spatial | checkerboard-deg
+  name: checkerboard-deg             # random | spatial | checkerboard-deg
   seed: 42                 # ensures reproducible splits
   test_split: 0.50         # fraction for *test* holdout (kept fixed across runs)
   val_split: 0.05          # fraction for *validation* (from remaining train pool)
@@ -115,7 +115,7 @@ split:
     fold_index: 0          # which fold is test (0..n_splits-1)
   checkerboard:
     scale: conus           # conus or global
-    deg: 8.0               # cell size in degrees
+    deg: 0.5               # cell size in degrees
     n_splits: 2            # number of folds in the checkerboard
     fold_index: 0          # which fold is used as test (0..n_splits-1)
     visualize: true        # optinal: for grid visualization downstream
@@ -128,8 +128,8 @@ split:
 
 train:
   device: cuda
-  mixed_precision: true
-  epochs: 100
+  mixed_precision: false
+  epochs: 150
   batch_size: 256
   grad_clip_norm: 1.0
   optimizer:
@@ -172,7 +172,7 @@ train:
   # -------- Location encoder pretraining (two-stage) --------
   # First N epochs: train only location encoder + physical heads.
   # After that: freeze location encoder and train EO encoder (LSTM branch).
-  loc_pretrain_epochs: 0
+  loc_pretrain_epochs: 50
   # Scale on observation (PM2.5) loss during pretraining.
   # 0.0 = physical-only pretraining (recommended for climplicit-style comparison)
   pretrain_pred_weight: 0.0
